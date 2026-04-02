@@ -1,3 +1,5 @@
+mod init;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -37,7 +39,7 @@ pub async fn run(args: Args) -> Result<()> {
     match args.command {
         Command::Init => {
             tracing::info!("initializing identity");
-            todo!("init command")
+            init::run().await
         }
         Command::Send { to, body } => {
             tracing::info!(%to, "sending message");
@@ -54,7 +56,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
         Command::Whoami => {
             tracing::info!("showing identity");
-            todo!("whoami command")
+            init::whoami().await
         }
     }
 }

@@ -11,6 +11,10 @@ pub struct Config {
     #[serde(default)]
     pub display_name: Option<String>,
 
+    /// Base64-encoded Ed25519 public key.
+    #[serde(default)]
+    pub public_key: Option<String>,
+
     /// Listen address for the P2P daemon.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
@@ -32,6 +36,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             display_name: None,
+            public_key: None,
             listen_addr: default_listen_addr(),
             mdns_enabled: true,
         }
@@ -111,6 +116,7 @@ mod tests {
     fn default_config_has_expected_values() {
         let cfg = Config::default();
         assert_eq!(cfg.display_name, None);
+        assert_eq!(cfg.public_key, None);
         assert_eq!(cfg.listen_addr, "/ip4/0.0.0.0/tcp/0");
         assert!(cfg.mdns_enabled);
     }
@@ -122,6 +128,7 @@ mod tests {
 
         let cfg = Config {
             display_name: Some("Alice".to_string()),
+            public_key: Some("dGVzdGtleQ==".to_string()),
             listen_addr: "/ip4/127.0.0.1/tcp/4001".to_string(),
             mdns_enabled: false,
         };

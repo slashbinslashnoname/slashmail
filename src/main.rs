@@ -3,6 +3,7 @@ mod compress;
 mod crypto;
 mod db;
 mod error;
+mod identity;
 mod keystore;
 mod net;
 mod storage;
