@@ -5,8 +5,10 @@ mod db;
 mod error;
 mod identity;
 mod keystore;
+mod message;
 mod net;
 mod storage;
+mod swarm;
 mod types;
 mod ui;
 
