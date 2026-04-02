@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Kind of swarm (e.g. direct message or group).
+/// Channel topology stored in the swarms config table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum SwarmKind {
+pub enum ChannelKind {
     /// One-to-one direct message channel.
     Direct,
     /// Multi-party group channel.
@@ -21,8 +21,8 @@ pub struct SwarmEntry {
     /// Human-readable name for this swarm.
     pub name: String,
 
-    /// Whether this is a direct or group swarm.
-    pub kind: SwarmKind,
+    /// Whether this is a direct or group channel.
+    pub kind: ChannelKind,
 
     /// Optional base64-encoded symmetric key used for group encryption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,7 +162,7 @@ mod tests {
             "swarm-abc".to_string(),
             SwarmEntry {
                 name: "Dev Chat".to_string(),
-                kind: SwarmKind::Group,
+                kind: ChannelKind::Group,
                 symmetric_key: Some("c2VjcmV0a2V5".to_string()),
             },
         );
@@ -170,7 +170,7 @@ mod tests {
             "swarm-dm1".to_string(),
             SwarmEntry {
                 name: "Alice DM".to_string(),
-                kind: SwarmKind::Direct,
+                kind: ChannelKind::Direct,
                 symmetric_key: None,
             },
         );
@@ -267,7 +267,7 @@ mod tests {
             "grp-123".to_string(),
             SwarmEntry {
                 name: "Team".to_string(),
-                kind: SwarmKind::Group,
+                kind: ChannelKind::Group,
                 symmetric_key: Some("a2V5ZGF0YQ==".to_string()),
             },
         );
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(loaded.swarms.len(), 1);
         let entry = &loaded.swarms["grp-123"];
         assert_eq!(entry.name, "Team");
-        assert_eq!(entry.kind, SwarmKind::Group);
+        assert_eq!(entry.kind, ChannelKind::Group);
         assert_eq!(entry.symmetric_key.as_deref(), Some("a2V5ZGF0YQ=="));
     }
 
@@ -296,7 +296,7 @@ mod tests {
             "dm-456".to_string(),
             SwarmEntry {
                 name: "Bob DM".to_string(),
-                kind: SwarmKind::Direct,
+                kind: ChannelKind::Direct,
                 symmetric_key: None,
             },
         );
@@ -341,11 +341,11 @@ kind = "direct"
         assert_eq!(cfg.swarms.len(), 2);
 
         let group = &cfg.swarms["my-group"];
-        assert_eq!(group.kind, SwarmKind::Group);
+        assert_eq!(group.kind, ChannelKind::Group);
         assert_eq!(group.symmetric_key.as_deref(), Some("c29tZWtleQ=="));
 
         let dm = &cfg.swarms["my-dm"];
-        assert_eq!(dm.kind, SwarmKind::Direct);
+        assert_eq!(dm.kind, ChannelKind::Direct);
         assert_eq!(dm.symmetric_key, None);
     }
 
