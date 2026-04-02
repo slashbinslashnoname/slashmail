@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "slashmail",
+  "project_id": "e446638a-2028-4f22-8fcb-3f6d61bc1126"
+}
