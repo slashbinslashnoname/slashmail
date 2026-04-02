@@ -8,6 +8,5 @@
 
 .slashbot/
 .slashbotrc
-.beads/
 .worktrees/
 *.__merge_tmp/
