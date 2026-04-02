@@ -1,11 +1,13 @@
 mod cli;
+mod compress;
 mod crypto;
 mod db;
+mod error;
 mod keystore;
 mod net;
-mod compress;
-mod ui;
+mod storage;
 mod types;
+mod ui;
 
 use anyhow::Result;
 use clap::Parser;
