@@ -11,8 +11,11 @@ pub async fn run() -> Result<()> {
     // Check if an identity already exists in config
     let config = Config::load()?;
     if config.public_key.is_some() {
+        let path = Config::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.slashmail/config.toml".to_string());
         anyhow::bail!(
-            "identity already initialised — run with a fresh config or delete the existing key first"
+            "identity already initialised — to reinitialise, remove the `public_key` field from {path}"
         );
     }
 
