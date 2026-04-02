@@ -336,6 +336,7 @@ mod tests {
         assert_eq!(all[0].recipient, "bob");
         assert_eq!(all[0].subject, "Test Subject");
         assert_eq!(all[0].body, "Test Body");
+        assert_eq!(all[0].created_at, msg.created_at);
         assert!(all[0].read);
     }
 
