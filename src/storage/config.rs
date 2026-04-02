@@ -2,7 +2,32 @@
 
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Kind of swarm (e.g. direct message or group).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SwarmKind {
+    /// One-to-one direct message channel.
+    Direct,
+    /// Multi-party group channel.
+    Group,
+}
+
+/// An entry in the swarms table inside `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwarmEntry {
+    /// Human-readable name for this swarm.
+    pub name: String,
+
+    /// Whether this is a direct or group swarm.
+    pub kind: SwarmKind,
+
+    /// Optional base64-encoded symmetric key used for group encryption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symmetric_key: Option<String>,
+}
 
 /// Application configuration persisted to `~/.slashmail/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,6 +47,10 @@ pub struct Config {
     /// Enable mDNS peer discovery on the local network.
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
+
+    /// Known swarms, keyed by swarm ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub swarms: HashMap<String, SwarmEntry>,
 }
 
 fn default_listen_addr() -> String {
@@ -39,6 +68,7 @@ impl Default for Config {
             public_key: None,
             listen_addr: default_listen_addr(),
             mdns_enabled: true,
+            swarms: HashMap::new(),
         }
     }
 }
@@ -119,6 +149,7 @@ mod tests {
         assert_eq!(cfg.public_key, None);
         assert_eq!(cfg.listen_addr, "/ip4/0.0.0.0/tcp/0");
         assert!(cfg.mdns_enabled);
+        assert!(cfg.swarms.is_empty());
     }
 
     #[test]
@@ -126,11 +157,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
+        let mut swarms = HashMap::new();
+        swarms.insert(
+            "swarm-abc".to_string(),
+            SwarmEntry {
+                name: "Dev Chat".to_string(),
+                kind: SwarmKind::Group,
+                symmetric_key: Some("c2VjcmV0a2V5".to_string()),
+            },
+        );
+        swarms.insert(
+            "swarm-dm1".to_string(),
+            SwarmEntry {
+                name: "Alice DM".to_string(),
+                kind: SwarmKind::Direct,
+                symmetric_key: None,
+            },
+        );
+
         let cfg = Config {
             display_name: Some("Alice".to_string()),
             public_key: Some("dGVzdGtleQ==".to_string()),
             listen_addr: "/ip4/127.0.0.1/tcp/4001".to_string(),
             mdns_enabled: false,
+            swarms,
         };
 
         cfg.save_to(&path).unwrap();
@@ -194,5 +244,123 @@ mod tests {
             parsed.get("display_name").and_then(|v| v.as_str()),
             Some("Test")
         );
+    }
+
+    #[test]
+    fn empty_swarms_not_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        Config::default().save_to(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[swarms]"), "empty swarms should be omitted from TOML");
+    }
+
+    #[test]
+    fn swarms_roundtrip_with_symmetric_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut swarms = HashMap::new();
+        swarms.insert(
+            "grp-123".to_string(),
+            SwarmEntry {
+                name: "Team".to_string(),
+                kind: SwarmKind::Group,
+                symmetric_key: Some("a2V5ZGF0YQ==".to_string()),
+            },
+        );
+
+        let cfg = Config {
+            swarms,
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+
+        assert_eq!(loaded.swarms.len(), 1);
+        let entry = &loaded.swarms["grp-123"];
+        assert_eq!(entry.name, "Team");
+        assert_eq!(entry.kind, SwarmKind::Group);
+        assert_eq!(entry.symmetric_key.as_deref(), Some("a2V5ZGF0YQ=="));
+    }
+
+    #[test]
+    fn swarms_roundtrip_without_symmetric_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut swarms = HashMap::new();
+        swarms.insert(
+            "dm-456".to_string(),
+            SwarmEntry {
+                name: "Bob DM".to_string(),
+                kind: SwarmKind::Direct,
+                symmetric_key: None,
+            },
+        );
+
+        let cfg = Config {
+            swarms,
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        // Verify symmetric_key is not present in serialized output
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("symmetric_key"), "None symmetric_key should be omitted");
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.swarms["dm-456"].symmetric_key, None);
+    }
+
+    #[test]
+    fn load_config_with_swarms_from_raw_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+display_name = "Eve"
+
+[swarms.my-group]
+name = "My Group"
+kind = "group"
+symmetric_key = "c29tZWtleQ=="
+
+[swarms.my-dm]
+name = "My DM"
+kind = "direct"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.display_name, Some("Eve".to_string()));
+        assert_eq!(cfg.swarms.len(), 2);
+
+        let group = &cfg.swarms["my-group"];
+        assert_eq!(group.kind, SwarmKind::Group);
+        assert_eq!(group.symmetric_key.as_deref(), Some("c29tZWtleQ=="));
+
+        let dm = &cfg.swarms["my-dm"];
+        assert_eq!(dm.kind, SwarmKind::Direct);
+        assert_eq!(dm.symmetric_key, None);
+    }
+
+    #[test]
+    fn legacy_config_without_swarms_loads_with_empty_map() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "display_name = \"Legacy\"\nlisten_addr = \"/ip4/0.0.0.0/tcp/4001\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.display_name, Some("Legacy".to_string()));
+        assert!(cfg.swarms.is_empty());
     }
 }
