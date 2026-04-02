@@ -1,31 +1,18 @@
 //! Binary codec for message envelopes: bincode serialization + zstd compression.
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::compress;
+use crate::types::Envelope;
 
-/// Wire-format envelope for network transport.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MessageEnvelope {
-    pub id: Uuid,
-    pub sender: String,
-    pub recipient: String,
-    pub payload: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Encode a `MessageEnvelope` to bytes (bincode + zstd).
-pub fn encode(envelope: &MessageEnvelope) -> Result<Vec<u8>> {
+/// Encode an [`Envelope`] to bytes (bincode + zstd).
+pub fn encode(envelope: &Envelope) -> Result<Vec<u8>> {
     let bin = bincode::serialize(envelope)?;
     compress::compress(&bin)
 }
 
-/// Decode bytes back into a `MessageEnvelope` (zstd + bincode).
-pub fn decode(data: &[u8]) -> Result<MessageEnvelope> {
+/// Decode bytes back into an [`Envelope`] (zstd + bincode).
+pub fn decode(data: &[u8]) -> Result<Envelope> {
     let bin = compress::decompress(data)?;
     Ok(bincode::deserialize(&bin)?)
 }
@@ -33,9 +20,11 @@ pub fn decode(data: &[u8]) -> Result<MessageEnvelope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
 
-    fn sample_envelope() -> MessageEnvelope {
-        MessageEnvelope {
+    fn sample_envelope() -> Envelope {
+        Envelope {
             id: Uuid::new_v4(),
             sender: "alice@example.com".into(),
             recipient: "bob@example.com".into(),
