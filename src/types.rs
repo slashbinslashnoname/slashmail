@@ -18,18 +18,22 @@ pub struct Envelope {
     pub swarm_id: String,
     /// Opaque message payload (cleartext or ciphertext depending on pipeline stage).
     pub payload: Vec<u8>,
+    /// Ed25519 signature over the payload (64 bytes when signed, empty before signing).
+    pub signature: Vec<u8>,
     /// When the envelope was created.
     pub timestamp: DateTime<Utc>,
 }
 
 impl Envelope {
     /// Create a new envelope with an auto-generated id and current timestamp.
+    /// The signature field is left empty; use [`message::codec::encode`] to sign.
     pub fn new(sender_pubkey: [u8; 32], swarm_id: String, payload: Vec<u8>) -> Self {
         Self {
             id: Uuid::new_v4(),
             sender_pubkey,
             swarm_id,
             payload,
+            signature: Vec::new(),
             timestamp: Utc::now(),
         }
     }
@@ -74,6 +78,7 @@ mod tests {
             sender_pubkey: [0xFF; 32],
             swarm_id: "s".into(),
             payload: vec![1],
+            signature: vec![0xAB; 64],
             timestamp: ts,
         };
         let a = bincode::serialize(&env).unwrap();
