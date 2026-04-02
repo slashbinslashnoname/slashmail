@@ -26,11 +26,10 @@ mod tests {
     fn sample_envelope() -> Envelope {
         Envelope {
             id: Uuid::new_v4(),
-            sender: "alice@example.com".into(),
-            recipient: "bob@example.com".into(),
+            sender_pubkey: [0xAA; 32],
+            swarm_id: "test-swarm".into(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            signature: vec![1, 2, 3, 4, 5],
-            created_at: Utc::now(),
+            timestamp: Utc::now(),
         }
     }
 
