@@ -10,6 +10,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub id: Uuid,
+    pub swarm_id: String,
+    pub folder_path: String,
+    pub sender_pubkey: [u8; 32],
     pub sender: String,
     pub recipient: String,
     pub subject: String,
@@ -64,13 +67,16 @@ impl MessageStore {
     fn migrate(&self) -> Result<(), AppError> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
-                id          TEXT PRIMARY KEY,
-                sender      TEXT NOT NULL,
-                recipient   TEXT NOT NULL,
-                subject     TEXT NOT NULL DEFAULT '',
-                body        TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                read        INTEGER NOT NULL DEFAULT 0
+                id             TEXT PRIMARY KEY,
+                swarm_id       TEXT NOT NULL DEFAULT '',
+                folder_path    TEXT NOT NULL DEFAULT 'INBOX',
+                sender_pubkey  BLOB NOT NULL DEFAULT X'',
+                sender         TEXT NOT NULL,
+                recipient      TEXT NOT NULL,
+                subject        TEXT NOT NULL DEFAULT '',
+                body           TEXT NOT NULL DEFAULT '',
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                read           INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -106,10 +112,13 @@ impl MessageStore {
     /// Insert a message into the store.
     pub fn insert_message(&self, msg: &Message) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT INTO messages (id, sender, recipient, subject, body, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 msg.id.to_string(),
+                msg.swarm_id,
+                msg.folder_path,
+                msg.sender_pubkey.as_slice(),
                 msg.sender,
                 msg.recipient,
                 msg.subject,
@@ -126,12 +135,12 @@ impl MessageStore {
     pub fn list_messages(&self, limit: u32) -> Result<Vec<Message>, AppError> {
         let sql = if limit > 0 {
             format!(
-                "SELECT id, sender, recipient, subject, body, created_at, read
+                "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read
                  FROM messages ORDER BY created_at DESC LIMIT {}",
                 limit
             )
         } else {
-            "SELECT id, sender, recipient, subject, body, created_at, read
+            "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read
              FROM messages ORDER BY created_at DESC"
                 .to_string()
         };
@@ -149,7 +158,7 @@ impl MessageStore {
     /// Uses FTS5 match syntax.
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>, AppError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.sender, m.recipient, m.subject, m.body, m.created_at, m.read
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.created_at, m.read
              FROM messages m
              JOIN messages_fts fts ON m.rowid = fts.rowid
              WHERE messages_fts MATCH ?1
@@ -171,11 +180,26 @@ impl MessageStore {
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let id_str: String = row.get(0)?;
-    let created_str: String = row.get(5)?;
-    let read_int: i32 = row.get(6)?;
+    let swarm_id: String = row.get(1)?;
+    let folder_path: String = row.get(2)?;
+    let pubkey_blob: Vec<u8> = row.get(3)?;
+    let created_str: String = row.get(8)?;
+    let read_int: i32 = row.get(9)?;
 
     let id = Uuid::parse_str(&id_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+
+    let sender_pubkey: [u8; 32] = pubkey_blob.try_into().map_err(|v: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("sender_pubkey has {} bytes, expected 32", v.len()),
+            )),
+        )
+    })?;
+
     let created_at = DateTime::parse_from_rfc3339(&created_str)
         .map(|dt| dt.with_timezone(&Utc))
         .or_else(|_| {
@@ -183,14 +207,17 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc())
         })
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?;
 
     Ok(Message {
         id,
-        sender: row.get(1)?,
-        recipient: row.get(2)?,
-        subject: row.get(3)?,
-        body: row.get(4)?,
+        swarm_id,
+        folder_path,
+        sender_pubkey,
+        sender: row.get(4)?,
+        recipient: row.get(5)?,
+        subject: row.get(6)?,
+        body: row.get(7)?,
         created_at,
         read: read_int != 0,
     })
@@ -203,6 +230,9 @@ mod tests {
     fn make_message(sender: &str, recipient: &str, subject: &str, body: &str) -> Message {
         Message {
             id: Uuid::new_v4(),
+            swarm_id: "test-swarm".to_string(),
+            folder_path: "INBOX".to_string(),
+            sender_pubkey: [0xAA; 32],
             sender: sender.to_string(),
             recipient: recipient.to_string(),
             subject: subject.to_string(),
@@ -319,6 +349,9 @@ mod tests {
 
         let msg = Message {
             id: Uuid::new_v4(),
+            swarm_id: "pub_general".to_string(),
+            folder_path: "INBOX/work".to_string(),
+            sender_pubkey: [0xBB; 32],
             sender: "alice".to_string(),
             recipient: "bob".to_string(),
             subject: "Test Subject".to_string(),
@@ -332,6 +365,9 @@ mod tests {
         let all = store.list_messages(0).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, msg.id);
+        assert_eq!(all[0].swarm_id, "pub_general");
+        assert_eq!(all[0].folder_path, "INBOX/work");
+        assert_eq!(all[0].sender_pubkey, [0xBB; 32]);
         assert_eq!(all[0].sender, "alice");
         assert_eq!(all[0].recipient, "bob");
         assert_eq!(all[0].subject, "Test Subject");
@@ -377,5 +413,56 @@ mod tests {
         let all = store2.list_messages(0).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].body, "Persistent message");
+        assert_eq!(all[0].swarm_id, "test-swarm");
+        assert_eq!(all[0].folder_path, "INBOX");
+        assert_eq!(all[0].sender_pubkey, [0xAA; 32]);
+    }
+
+    #[test]
+    fn new_columns_roundtrip_distinct_values() {
+        let store = MessageStore::open_memory().unwrap();
+
+        let mut m1 = make_message("alice", "bob", "Hi", "Hello");
+        m1.swarm_id = "pub_general".to_string();
+        m1.folder_path = "INBOX/priority".to_string();
+        m1.sender_pubkey = [0x01; 32];
+
+        let mut m2 = make_message("carol", "dave", "Re", "World");
+        m2.swarm_id = "prv_alice_bob".to_string();
+        m2.folder_path = "Sent".to_string();
+        m2.sender_pubkey = [0x02; 32];
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+
+        let all = store.list_messages(0).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Newest first
+        assert_eq!(all[0].swarm_id, "prv_alice_bob");
+        assert_eq!(all[0].folder_path, "Sent");
+        assert_eq!(all[0].sender_pubkey, [0x02; 32]);
+
+        assert_eq!(all[1].swarm_id, "pub_general");
+        assert_eq!(all[1].folder_path, "INBOX/priority");
+        assert_eq!(all[1].sender_pubkey, [0x01; 32]);
+    }
+
+    #[test]
+    fn search_returns_new_columns() {
+        let store = MessageStore::open_memory().unwrap();
+
+        let mut m = make_message("alice", "bob", "Searchable", "unique_search_term_abc");
+        m.swarm_id = "pub_room".to_string();
+        m.folder_path = "Archive".to_string();
+        m.sender_pubkey = [0xCC; 32];
+
+        store.insert_message(&m).unwrap();
+
+        let results = store.search_messages("unique_search_term_abc").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].swarm_id, "pub_room");
+        assert_eq!(results[0].folder_path, "Archive");
+        assert_eq!(results[0].sender_pubkey, [0xCC; 32]);
     }
 }
