@@ -55,9 +55,7 @@ impl Config {
     /// Ensure the `~/.slashmail/` directory exists. Creates it if missing.
     pub fn ensure_dir() -> Result<PathBuf, AppError> {
         let dir = Self::data_dir()?;
-        if !dir.exists() {
-            std::fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, e))?;
-        }
+        std::fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, e))?;
         Ok(dir)
     }
 
@@ -91,9 +89,7 @@ impl Config {
     /// Save configuration to an arbitrary path.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
-            }
+            std::fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
         }
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content).map_err(|e| AppError::io(path, e))?;
