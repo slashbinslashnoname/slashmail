@@ -70,7 +70,7 @@ impl MessageStore {
                 id             TEXT PRIMARY KEY,
                 swarm_id       TEXT NOT NULL DEFAULT '',
                 folder_path    TEXT NOT NULL DEFAULT 'INBOX',
-                sender_pubkey  BLOB NOT NULL DEFAULT X'',
+                sender_pubkey  BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000',
                 sender         TEXT NOT NULL,
                 recipient      TEXT NOT NULL,
                 subject        TEXT NOT NULL DEFAULT '',
@@ -133,20 +133,12 @@ impl MessageStore {
     /// List messages ordered by creation time (newest first).
     /// Pass `limit = 0` for no limit.
     pub fn list_messages(&self, limit: u32) -> Result<Vec<Message>, AppError> {
-        let sql = if limit > 0 {
-            format!(
-                "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read
-                 FROM messages ORDER BY created_at DESC LIMIT {}",
-                limit
-            )
-        } else {
+        let limit_val: i64 = if limit > 0 { limit as i64 } else { -1 };
+        let mut stmt = self.conn.prepare(
             "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read
-             FROM messages ORDER BY created_at DESC"
-                .to_string()
-        };
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], row_to_message)?;
+             FROM messages ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit_val], row_to_message)?;
         let mut messages = Vec::new();
         for row in rows {
             messages.push(row?);
