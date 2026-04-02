@@ -41,4 +41,12 @@ mod tests {
         let sig = sign(&kp, b"original");
         assert!(verify(&kp.verifying_key(), b"tampered", &sig).is_err());
     }
+
+    #[test]
+    fn verify_rejects_wrong_public_key() {
+        let kp = generate_keypair();
+        let other_kp = generate_keypair();
+        let sig = sign(&kp, b"hello");
+        assert!(verify(&other_kp.verifying_key(), b"hello", &sig).is_err());
+    }
 }
