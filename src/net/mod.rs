@@ -77,6 +77,30 @@ mod tests {
         assert_eq!(kp1.public().to_peer_id(), kp2.public().to_peer_id());
     }
 
+    #[test]
+    fn convert_keypair_preserves_signing_capability() {
+        use ed25519_dalek::Verifier;
+
+        let identity = Identity::generate();
+        let libp2p_keypair = convert_keypair(&identity).unwrap();
+
+        // Sign with the libp2p ed25519 keypair.
+        let msg = b"slashmail test message";
+        let libp2p_ed25519 = libp2p_keypair
+            .try_into_ed25519()
+            .expect("should be ed25519");
+        let sig_bytes = libp2p_ed25519.sign(msg);
+
+        // Verify with the original dalek public key — proves secret key was preserved.
+        let dalek_pk = identity.public_key();
+        let sig_array: [u8; 64] = sig_bytes.try_into().expect("signature must be 64 bytes");
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(&sig_array);
+        assert!(
+            dalek_pk.verify(msg, &dalek_sig).is_ok(),
+            "signature from converted keypair must verify with original dalek public key"
+        );
+    }
+
     #[tokio::test]
     async fn build_swarm_starts() {
         let identity = Identity::generate();

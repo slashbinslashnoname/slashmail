@@ -3,6 +3,7 @@
 use libp2p::identity::Keypair;
 use libp2p::{gossipsub, identify, kad, mdns, swarm::NetworkBehaviour, PeerId};
 use std::time::Duration;
+use thiserror::Error;
 
 /// Combined libp2p behaviour for slashmail.
 #[derive(NetworkBehaviour)]
@@ -14,16 +15,9 @@ pub struct SlashmailBehaviour {
 }
 
 /// Error type for behaviour construction.
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("behaviour error: {0}")]
 pub struct BehaviourError(String);
-
-impl std::fmt::Display for BehaviourError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "behaviour error: {}", self.0)
-    }
-}
-
-impl std::error::Error for BehaviourError {}
 
 impl SlashmailBehaviour {
     /// Build a new composite behaviour from a libp2p identity keypair.
@@ -78,14 +72,12 @@ mod tests {
     }
 
     #[test]
-    fn behaviour_fields_are_accessible() {
+    fn behaviour_gossipsub_subscribe_then_unsubscribe() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key).unwrap();
-        // Verify all four sub-behaviours are present and accessible.
-        let _ = &behaviour.gossipsub;
-        let _ = &behaviour.kademlia;
-        let _ = &behaviour.identify;
-        let _ = &behaviour.mdns;
+        let mut behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let topic = gossipsub::IdentTopic::new("another-topic");
+        assert!(behaviour.gossipsub.subscribe(&topic).is_ok());
+        assert!(behaviour.gossipsub.unsubscribe(&topic).is_ok());
     }
 
     #[test]
