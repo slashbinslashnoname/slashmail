@@ -1,6 +1,7 @@
 //! Networking layer: libp2p transport, behaviour, and swarm construction.
 
 pub mod behaviour;
+pub mod rr;
 pub mod transport;
 
 use crate::error::AppError;
