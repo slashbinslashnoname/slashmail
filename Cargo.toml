@@ -1,0 +1,66 @@
+[package]
+name = "slashmail"
+version = "0.1.0"
+edition = "2021"
+description = "Peer-to-peer encrypted mail"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# P2P networking
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "noise",
+    "tcp",
+    "yamux",
+    "quic",
+    "dns",
+    "gossipsub",
+    "kad",
+    "identify",
+    "mdns",
+    "macros",
+] }
+
+# Cryptography
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+chacha20poly1305 = "0.10"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Secrets
+keyring = "3"
+
+# Compression
+zstd = "0.13"
+
+# Serialization
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Hashing
+sha2 = "0.10"
+
+# Terminal UI
+termimad = "0.30"
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+directories = "6"
+
+[dev-dependencies]
+tempfile = "3"
