@@ -201,6 +201,24 @@ mod tests {
     }
 
     #[test]
+    fn signature_rejects_tampered_sender_pubkey() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        let other_kp = generate_keypair();
+        decoded.sender_pubkey = other_kp.verifying_key().to_bytes(); // spoof sender
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        // verify against the spoofed key — must fail (wrong key AND wrong signed bytes)
+        assert!(sign::verify(&other_kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+        // verify against original key also fails because signed bytes changed
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
     fn encoded_starts_with_version_byte() {
         let kp = generate_keypair();
         let envelope = sample_envelope();
