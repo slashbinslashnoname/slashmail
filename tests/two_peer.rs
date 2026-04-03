@@ -442,12 +442,12 @@ async fn delta_sync_three_messages_to_late_joiner() {
                         let local_tree = MerkleTree::from_ids(&store_b.all_message_ids().unwrap());
                         let remote_bucket_ids: Vec<(u16, Vec<uuid::Uuid>)> = buckets
                             .iter()
-                            .filter_map(|(idx, id_strings)| {
+                            .map(|(idx, id_strings)| {
                                 let uuids: Vec<uuid::Uuid> = id_strings
                                     .iter()
                                     .filter_map(|s| uuid::Uuid::parse_str(s).ok())
                                     .collect();
-                                Some((*idx, uuids))
+                                (*idx, uuids)
                             })
                             .collect();
                         let missing = local_tree.missing_ids(&remote_bucket_ids);
