@@ -243,8 +243,8 @@ fn handle_swarm_event(event: SwarmEvent<SlashmailBehaviourEvent>, in_flight: &mu
         SwarmEvent::ExternalAddrExpired { address, .. } => {
             debug!(%address, "external address expired");
         }
-        _ => {
-            debug!("unhandled swarm event");
+        event => {
+            debug!(?event, "unhandled swarm event");
         }
     }
 }
