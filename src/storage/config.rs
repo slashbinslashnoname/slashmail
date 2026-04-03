@@ -104,6 +104,11 @@ impl Config {
         Ok(Self::data_dir()?.join("messages.db"))
     }
 
+    /// Return the path to the daemon PID file (`~/.slashmail/daemon.pid`).
+    pub fn pid_path() -> Result<PathBuf, AppError> {
+        Ok(Self::data_dir()?.join("daemon.pid"))
+    }
+
     /// Ensure the `~/.slashmail/` directory exists. Creates it if missing.
     pub fn ensure_dir() -> Result<PathBuf, AppError> {
         let dir = Self::data_dir()?;

@@ -61,8 +61,25 @@ pub enum Command {
     },
     /// List known peers
     Peers,
-    /// Start the P2P daemon
+    /// Manage the P2P daemon
     Daemon {
+        #[command(subcommand)]
+        action: DaemonCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Start the P2P daemon
+    Start {
+        /// Listen address
+        #[arg(short, long, default_value = "/ip4/0.0.0.0/tcp/0")]
+        listen: String,
+    },
+    /// Stop the running daemon
+    Stop,
+    /// Restart the daemon (stop + start)
+    Restart {
         /// Listen address
         #[arg(short, long, default_value = "/ip4/0.0.0.0/tcp/0")]
         listen: String,
@@ -364,21 +381,115 @@ pub async fn run(args: Args) -> Result<()> {
                 }
             }
         }
-        Command::Daemon { listen } => {
-            tracing::info!(%listen, "starting daemon");
-            run_daemon(listen).await
-        }
+        Command::Daemon { action } => match action {
+            DaemonCommand::Start { listen } => {
+                tracing::info!(%listen, "starting daemon");
+                run_daemon_start(listen).await
+            }
+            DaemonCommand::Stop => {
+                tracing::info!("stopping daemon");
+                run_daemon_stop().await
+            }
+            DaemonCommand::Restart { listen } => {
+                tracing::info!(%listen, "restarting daemon");
+                run_daemon_stop().await.ok(); // ignore error if not running
+                run_daemon_start(listen).await
+            }
+        },
     }
 }
 
+// ---------------------------------------------------------------------------
+// PID file management
+// ---------------------------------------------------------------------------
+
+/// Read the PID from the daemon PID file. Returns `None` if the file doesn't
+/// exist or can't be parsed.
+fn read_pid_file() -> Result<Option<u32>> {
+    let pid_path = Config::pid_path()?;
+    if !pid_path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&pid_path)
+        .map_err(|e| AppError::io(&pid_path, e))?;
+    match contents.trim().parse::<u32>() {
+        Ok(pid) => Ok(Some(pid)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Write the current process PID to the daemon PID file.
+fn write_pid_file() -> Result<()> {
+    let pid_path = Config::pid_path()?;
+    Config::ensure_dir()?;
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .map_err(|e| AppError::io(&pid_path, e))?;
+    Ok(())
+}
+
+/// Remove the daemon PID file.
+fn remove_pid_file() {
+    if let Ok(pid_path) = Config::pid_path() {
+        let _ = std::fs::remove_file(pid_path);
+    }
+}
+
+/// Check whether a process with the given PID is alive.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    use nix::sys::signal;
+    use nix::unistd::Pid;
+    // Signal 0 doesn't send a signal but checks if the process exists.
+    signal::kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+/// Stop a running daemon by sending SIGTERM to the PID in the PID file.
+#[cfg(unix)]
+async fn run_daemon_stop() -> Result<()> {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::Pid;
+
+    let pid = read_pid_file()?.ok_or_else(|| {
+        anyhow::anyhow!("no PID file found — daemon is not running")
+    })?;
+
+    if !is_pid_alive(pid) {
+        remove_pid_file();
+        anyhow::bail!("daemon is not running (stale PID file for pid {pid})");
+    }
+
+    signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+        .map_err(|e| anyhow::anyhow!("failed to send SIGTERM to pid {pid}: {e}"))?;
+
+    // Wait briefly for the process to exit, then clean up the PID file.
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !is_pid_alive(pid) {
+            break;
+        }
+    }
+    remove_pid_file();
+    println!("Daemon stopped (pid {pid}).");
+    Ok(())
+}
+
 /// Start the P2P daemon: load identity, build swarm, open control socket, run event loop.
-async fn run_daemon(listen: String) -> Result<()> {
+async fn run_daemon_start(listen: String) -> Result<()> {
     use crate::engine;
     use crate::identity::Identity;
     use crate::net;
     use crate::storage::db::MessageStore;
     use libp2p::Multiaddr;
     use tokio::sync::mpsc;
+
+    // Check for an already-running daemon via PID file.
+    if let Some(pid) = read_pid_file()? {
+        if is_pid_alive(pid) {
+            anyhow::bail!("daemon is already running (pid {pid})");
+        }
+        // Stale PID file — clean it up.
+        remove_pid_file();
+    }
 
     let identity = Identity::load_from_keyring()?;
     let config = Config::load()?;
@@ -403,6 +514,9 @@ async fn run_daemon(listen: String) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to listen on relay: {e}"))?;
         println!("Relay:   {relay}");
     }
+
+    // Write PID file before announcing readiness.
+    write_pid_file()?;
 
     println!("PeerId:  {peer_id}");
     println!("Daemon running. Press Ctrl-C to stop.");
@@ -429,7 +543,8 @@ async fn run_daemon(listen: String) -> Result<()> {
     let keypair = identity.keypair().clone();
     let reason = engine::run_loop(swarm, cmd_rx, Some(store), Some(wal_flush), Some(&keypair)).await;
 
-    // Clean up the socket file.
+    // Clean up PID file and socket.
+    remove_pid_file();
     let _ = std::fs::remove_file(&sock_path);
 
     tracing::info!(?reason, "daemon stopped");
