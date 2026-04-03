@@ -26,10 +26,11 @@ fn parse_status() {
 
 #[test]
 fn parse_send_with_to_and_tags() {
-    let args = parse(&["slashmail", "send", "--to", "AAAA", "--tags", "inbox,urgent"]);
+    let args = parse(&["slashmail", "send", "--to", "AAAA", "--body", "hello", "--tags", "inbox,urgent"]);
     match args.command {
-        Command::Send { to, tags } => {
+        Command::Send { to, body, tags } => {
             assert_eq!(to, "AAAA");
+            assert_eq!(body, "hello");
             assert_eq!(tags, vec!["inbox", "urgent"]);
         }
         _ => panic!("expected Send"),
@@ -38,14 +39,27 @@ fn parse_send_with_to_and_tags() {
 
 #[test]
 fn parse_send_no_tags() {
-    let args = parse(&["slashmail", "send", "--to", "BBBB"]);
+    let args = parse(&["slashmail", "send", "--to", "BBBB", "--body", "hi"]);
     match args.command {
-        Command::Send { to, tags } => {
+        Command::Send { to, body, tags } => {
             assert_eq!(to, "BBBB");
+            assert_eq!(body, "hi");
             assert!(tags.is_empty());
         }
         _ => panic!("expected Send"),
     }
+}
+
+#[test]
+fn parse_send_requires_body() {
+    let result = Args::try_parse_from(&["slashmail", "send", "--to", "AAAA"]);
+    assert!(result.is_err(), "send should require --body");
+}
+
+#[test]
+fn parse_send_requires_to() {
+    let result = Args::try_parse_from(&["slashmail", "send", "--body", "hello"]);
+    assert!(result.is_err(), "send should require --to");
 }
 
 #[test]

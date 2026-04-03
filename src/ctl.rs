@@ -23,6 +23,11 @@ pub enum CtlRequest {
     Status,
     AddPeer { addr: String },
     Peers,
+    Send {
+        to: String,
+        body: String,
+        tags: Vec<String>,
+    },
 }
 
 /// JSON response sent back to CLI clients.
@@ -32,6 +37,11 @@ pub enum CtlResponse {
     Status(StatusInfo),
     AddPeer { ok: bool, error: Option<String> },
     Peers { peers: Vec<PeerInfo> },
+    Send {
+        ok: bool,
+        message_id: Option<String>,
+        error: Option<String>,
+    },
     Error { message: String },
 }
 
@@ -173,6 +183,38 @@ async fn dispatch(req: CtlRequest, cmd_tx: &mpsc::Sender<EngineCommand>) -> CtlR
                 },
             }
         }
+        CtlRequest::Send { to, body, tags } => {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(EngineCommand::SendMessage {
+                    to,
+                    body,
+                    tags,
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return CtlResponse::Error {
+                    message: "engine channel closed".into(),
+                };
+            }
+            match reply_rx.await {
+                Ok(Ok(message_id)) => CtlResponse::Send {
+                    ok: true,
+                    message_id: Some(message_id),
+                    error: None,
+                },
+                Ok(Err(e)) => CtlResponse::Send {
+                    ok: false,
+                    message_id: None,
+                    error: Some(e),
+                },
+                Err(_) => CtlResponse::Error {
+                    message: "engine did not respond".into(),
+                },
+            }
+        }
     }
 }
 
@@ -262,6 +304,66 @@ mod tests {
                 assert_eq!(peers[0].rtt_ms, Some(12.5));
             }
             _ => panic!("expected Peers"),
+        }
+    }
+
+    #[test]
+    fn send_request_serialization_roundtrip() {
+        let req = CtlRequest::Send {
+            to: "AAAA".into(),
+            body: "hello world".into(),
+            tags: vec!["inbox".into(), "urgent".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: CtlRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            CtlRequest::Send { to, body, tags } => {
+                assert_eq!(to, "AAAA");
+                assert_eq!(body, "hello world");
+                assert_eq!(tags, vec!["inbox", "urgent"]);
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn send_response_ok_roundtrip() {
+        let resp = CtlResponse::Send {
+            ok: true,
+            message_id: Some("abc-123".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: CtlResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            CtlResponse::Send {
+                ok,
+                message_id,
+                error,
+            } => {
+                assert!(ok);
+                assert_eq!(message_id.as_deref(), Some("abc-123"));
+                assert!(error.is_none());
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn send_response_err_roundtrip() {
+        let resp = CtlResponse::Send {
+            ok: false,
+            message_id: None,
+            error: Some("bad key".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: CtlResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            CtlResponse::Send { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.as_deref(), Some("bad key"));
+            }
+            _ => panic!("expected Send"),
         }
     }
 
