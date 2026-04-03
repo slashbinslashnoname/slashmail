@@ -1,9 +1,12 @@
-//! Composite network behaviour combining Gossipsub, Kademlia, Identify, and mDNS.
+//! Composite network behaviour combining Gossipsub, Kademlia, Identify, mDNS,
+//! and request-response for direct mail delivery.
 
 use libp2p::identity::Keypair;
-use libp2p::{gossipsub, identify, kad, mdns, swarm::NetworkBehaviour, PeerId};
+use libp2p::{gossipsub, identify, kad, mdns, request_response, swarm::NetworkBehaviour, PeerId};
 use std::time::Duration;
 use thiserror::Error;
+
+use super::rr::{self, MailCodec};
 
 /// Combined libp2p behaviour for slashmail.
 #[derive(NetworkBehaviour)]
@@ -12,6 +15,7 @@ pub struct SlashmailBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub identify: identify::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
+    pub mail_rr: request_response::Behaviour<MailCodec>,
 }
 
 /// Error type for behaviour construction.
@@ -51,11 +55,15 @@ impl SlashmailBehaviour {
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .map_err(|e| BehaviourError(format!("mdns: {e}")))?;
 
+        // Request-response for direct private mail delivery.
+        let mail_rr = rr::mail_behaviour();
+
         Ok(Self {
             gossipsub,
             kademlia,
             identify,
             mdns,
+            mail_rr,
         })
     }
 }
