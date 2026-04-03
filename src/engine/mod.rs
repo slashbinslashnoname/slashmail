@@ -84,7 +84,6 @@ pub async fn run_loop(
     store: Option<MessageStore>,
     wal_flush: Option<Box<dyn FnOnce() + Send>>,
     keypair: Option<&Keypair>,
-    store: Option<&MessageStore>,
 ) -> ShutdownReason {
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
@@ -121,14 +120,14 @@ pub async fn run_loop(
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, &mut in_flight, keypair, store);
+                let action = handle_swarm_event(event, &mut in_flight, keypair, store.as_ref());
                 apply_swarm_action(&mut swarm, action);
             }
         }
     };
 
     // --- Graceful shutdown sequence ---
-    drain_in_flight(&mut swarm, &mut in_flight, keypair, store).await;
+    drain_in_flight(&mut swarm, &mut in_flight, keypair, store.as_ref()).await;
 
     if let Some(flush) = wal_flush {
         info!("flushing SQLite WAL checkpoint");
@@ -1112,7 +1111,7 @@ mod tests {
             .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, Some(store), None).await;
+        let reason = run_loop(swarm, rx, Some(store), None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
 
         let result = reply_rx.await.unwrap();
@@ -1143,7 +1142,7 @@ mod tests {
             .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None, None).await;
+        let reason = run_loop(swarm, rx, None, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
 
         let result = reply_rx.await.unwrap();
@@ -1163,7 +1162,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None, None).await;
+        let reason = run_loop(swarm, rx, None, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
 
         // AddPeer dials the address — result depends on network, but should not panic.
