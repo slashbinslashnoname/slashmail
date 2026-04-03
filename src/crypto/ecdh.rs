@@ -192,4 +192,94 @@ mod tests {
         fn assert_zeroize<T: Zeroize + ZeroizeOnDrop>() {}
         assert_zeroize::<SharedSecret>();
     }
+
+    /// Verify Ed25519→X25519 secret-key derivation against libsodium's
+    /// `crypto_sign_ed25519_sk_to_curve25519` test vector.
+    #[test]
+    fn ed25519_to_x25519_known_vector() {
+        // Libsodium primary test vector (ed25519_convert.c / ed25519_convert.exp)
+        let seed_hex = "421151a459faeade3d247115f94aedae42318124095afabe4d1451a559faedee";
+        let expected_x25519_pk_hex =
+            "f1814f0e8ff1043d8a44d25babff3cedcae6c22c3edaa48f857ae70de2baae50";
+
+        let mut seed = [0u8; 32];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&seed_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let mut expected_pk = [0u8; 32];
+        for (i, byte) in expected_pk.iter_mut().enumerate() {
+            *byte =
+                u8::from_str_radix(&expected_x25519_pk_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+
+        let signing_key = Keypair::from_bytes(&seed);
+        let x25519_pub = ed25519_to_x25519_public(&signing_key.verifying_key());
+        assert_eq!(
+            x25519_pub.0.as_bytes(),
+            &expected_pk,
+            "X25519 public key does not match libsodium test vector"
+        );
+    }
+
+    /// Encrypt individual tags with ECDH-derived shared secret and decrypt them,
+    /// mimicking the engine's private-message tag handling.
+    #[test]
+    fn tag_encrypt_decrypt_roundtrip() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+        let shared = derive_shared_secret(&alice, &bob.verifying_key());
+        let tags = vec!["inbox", "urgent", "étiquette"];
+
+        for tag in &tags {
+            let ciphertext =
+                super::super::encryption::seal(shared.as_bytes(), tag.as_bytes()).unwrap();
+            // Ciphertext must differ from plaintext
+            assert_ne!(&ciphertext, tag.as_bytes());
+            // Recipient derives same shared secret and decrypts
+            let shared_bob = derive_shared_secret(&bob, &alice.verifying_key());
+            let plaintext =
+                super::super::encryption::open(shared_bob.as_bytes(), &ciphertext).unwrap();
+            assert_eq!(plaintext, tag.as_bytes());
+        }
+    }
+
+    /// Tag decryption with wrong key must fail.
+    #[test]
+    fn tag_decrypt_wrong_key_fails() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+        let carol = generate_keypair();
+        let shared_ab = derive_shared_secret(&alice, &bob.verifying_key());
+        let ciphertext =
+            super::super::encryption::seal(shared_ab.as_bytes(), b"secret-tag").unwrap();
+        // Carol cannot decrypt a tag encrypted with Alice↔Bob shared secret
+        let shared_carol = derive_shared_secret(&carol, &alice.verifying_key());
+        assert!(
+            super::super::encryption::open(shared_carol.as_bytes(), &ciphertext).is_err()
+        );
+    }
+
+    /// Runtime check: SharedSecret memory is zeroed after drop.
+    ///
+    /// We allocate on the heap via Box, capture the pointer, drop the value,
+    /// then verify the backing memory has been overwritten to all zeros.
+    #[test]
+    fn zeroize_shared_secret_overwrites_buffer() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+        let secret = Box::new(derive_shared_secret(&alice, &bob.verifying_key()));
+        // Verify it's non-zero before drop
+        let non_zero = secret.as_bytes().iter().any(|&b| b != 0);
+        assert!(non_zero, "shared secret should be non-zero");
+        let ptr = secret.as_bytes().as_ptr();
+        drop(secret);
+        // SAFETY: We just dropped the Box; the allocator hasn't reused this memory yet.
+        // We read 32 bytes that were formerly the SharedSecret inner buffer.
+        let after_drop: [u8; 32] = unsafe { std::ptr::read(ptr as *const [u8; 32]) };
+        assert_eq!(
+            after_drop,
+            [0u8; 32],
+            "SharedSecret buffer was not zeroed on drop"
+        );
+    }
 }
