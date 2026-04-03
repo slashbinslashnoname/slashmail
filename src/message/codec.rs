@@ -237,6 +237,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_old_version_zero() {
+        let kp = generate_keypair();
+        let envelope = sample_envelope();
+        let mut encoded = encode(&envelope, &kp).unwrap();
+        encoded[0] = 0; // hypothetical old version
+        let err = decode(&encoded).unwrap_err();
+        assert!(err.to_string().contains("unsupported codec version 0"));
+    }
+
+    #[test]
+    fn decode_rejects_future_version() {
+        let kp = generate_keypair();
+        let envelope = sample_envelope();
+        let mut encoded = encode(&envelope, &kp).unwrap();
+        encoded[0] = CODEC_VERSION + 1; // future version
+        let err = decode(&encoded).unwrap_err();
+        assert!(err.to_string().contains("unsupported codec version"));
+    }
+
+    #[test]
     fn decode_rejects_empty_input() {
         let err = decode(&[]).unwrap_err();
         assert!(err.to_string().contains("empty codec payload"));

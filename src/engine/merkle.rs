@@ -237,4 +237,22 @@ mod tests {
         let tree = MerkleTree::from_ids(&[]);
         assert!(tree.bucket_ids(999).is_empty());
     }
+
+    #[test]
+    fn root_is_stable_across_calls() {
+        // Fixed UUID ensures root is deterministic across runs.
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let root1 = *MerkleTree::from_ids(&[id]).root();
+        let root2 = *MerkleTree::from_ids(&[id]).root();
+        assert_eq!(root1, root2);
+        // And different from empty tree.
+        assert_ne!(root1, *MerkleTree::from_ids(&[]).root());
+    }
+
+    #[test]
+    fn empty_root_differs_from_all_zero_hash() {
+        // The empty root is SHA-256 of 256 zero-hashes, not zero itself.
+        let tree = MerkleTree::from_ids(&[]);
+        assert_ne!(*tree.root(), EMPTY_HASH);
+    }
 }
