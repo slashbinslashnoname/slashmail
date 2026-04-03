@@ -107,6 +107,17 @@ pub enum EngineCommand {
     GetSubscriptions {
         reply: tokio::sync::oneshot::Sender<HashMap<String, String>>,
     },
+    /// Send an encrypted private message to a recipient.
+    ///
+    /// The engine encrypts the body and tags, signs the envelope, and
+    /// dispatches it via the request-response protocol. The reply carries
+    /// the message UUID on success or an error string on failure.
+    SendMessage {
+        to: String,
+        body: String,
+        tags: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     /// Request a graceful shutdown.
     Shutdown,
 }
@@ -168,7 +179,7 @@ pub async fn run_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(command) => {
-                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers, &mut topic_registry) {
+                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers, &mut topic_registry, keypair, &mut in_flight) {
                             break reason;
                         }
                     }
@@ -246,6 +257,8 @@ fn handle_command(
     store: Option<&MessageStore>,
     peers: &HashMap<PeerId, PeerState>,
     topic_registry: &mut TopicRegistry,
+    keypair: Option<&Keypair>,
+    in_flight: &mut usize,
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
@@ -367,11 +380,85 @@ fn handle_command(
             let _ = reply.send(subs);
             None
         }
+        EngineCommand::SendMessage {
+            to,
+            body,
+            tags,
+            reply,
+        } => {
+            let result = (|| -> Result<String, String> {
+                let kp = keypair.ok_or("no keypair configured")?;
+
+                // Parse recipient public key from base64.
+                let recipient_pubkey = crate::identity::Identity::parse_public_key(&to)
+                    .map_err(|e| format!("invalid recipient key: {e}"))?;
+
+                // Derive PeerId from the recipient's Ed25519 public key.
+                let peer_id = peer_id_from_ed25519_pubkey(&recipient_pubkey)
+                    .map_err(|e| format!("failed to derive peer id: {e}"))?;
+
+                // Derive ECDH shared secret for tag encryption.
+                let shared = ecdh::derive_shared_secret(kp, &recipient_pubkey);
+
+                // Encrypt the message body.
+                let encrypted_payload = ecdh::seal_for(kp, &recipient_pubkey, body.as_bytes())
+                    .map_err(|e| format!("encryption failed: {e}"))?;
+
+                // Encrypt each tag and base64-encode.
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let encrypted_tags: Vec<String> = tags
+                    .iter()
+                    .map(|tag| {
+                        let ct = encryption::seal(shared.as_bytes(), tag.as_bytes())
+                            .map_err(|e| format!("tag encryption failed: {e}"))?;
+                        Ok(b64.encode(&ct))
+                    })
+                    .collect::<Result<Vec<String>, String>>()?;
+
+                // Build the envelope.
+                let mut envelope = crate::types::Envelope::new(
+                    kp.verifying_key().to_bytes(),
+                    "dm".into(),
+                    encrypted_payload,
+                );
+                envelope.recipient = Some(peer_id);
+                envelope.tags = encrypted_tags;
+
+                let message_id = envelope.id.to_string();
+
+                // Encode (signs the payload and compresses).
+                let encoded = msg_codec::encode(&envelope, kp)
+                    .map_err(|e| format!("codec encode failed: {e}"))?;
+
+                // Dispatch via request-response.
+                let request = MailRequest {
+                    envelope_data: encoded,
+                };
+                swarm
+                    .behaviour_mut()
+                    .mail_rr
+                    .send_request(&peer_id, request);
+                *in_flight += 1;
+
+                info!(%peer_id, %message_id, "private message sent via request-response");
+                Ok(message_id)
+            })();
+            let _ = reply.send(result);
+            None
+        }
         EngineCommand::Shutdown => {
             info!("shutdown command received");
             Some(ShutdownReason::Command)
         }
     }
+}
+
+/// Derive a libp2p [`PeerId`] from an Ed25519 public key.
+fn peer_id_from_ed25519_pubkey(pubkey: &PublicKey) -> Result<PeerId, String> {
+    let ed25519_pk = libp2p::identity::ed25519::PublicKey::try_from_bytes(pubkey.as_bytes())
+        .map_err(|e| format!("invalid ed25519 public key: {e}"))?;
+    let libp2p_pk = libp2p::identity::PublicKey::from(ed25519_pk);
+    Ok(PeerId::from(libp2p_pk))
 }
 
 /// An action to be applied to the swarm after event processing.
@@ -1723,5 +1810,169 @@ mod tests {
             // Should skip malformed entries without panicking.
             dial_learned_peers(&mut swarm, &[bad_info]);
         });
+    }
+
+    // ---- peer_id_from_ed25519_pubkey tests ----
+
+    #[test]
+    fn peer_id_from_pubkey_deterministic() {
+        let kp = generate_keypair();
+        let pk = kp.verifying_key();
+        let pid1 = peer_id_from_ed25519_pubkey(&pk).unwrap();
+        let pid2 = peer_id_from_ed25519_pubkey(&pk).unwrap();
+        assert_eq!(pid1, pid2);
+    }
+
+    #[test]
+    fn peer_id_from_pubkey_matches_libp2p_conversion() {
+        let identity = Identity::generate();
+        let libp2p_kp = crate::net::convert_keypair(&identity).unwrap();
+        let expected_peer_id = PeerId::from(libp2p_kp.public());
+
+        let derived = peer_id_from_ed25519_pubkey(&identity.public_key()).unwrap();
+        assert_eq!(derived, expected_peer_id);
+    }
+
+    #[test]
+    fn peer_id_different_keys_produce_different_ids() {
+        let kp1 = generate_keypair();
+        let kp2 = generate_keypair();
+        let pid1 = peer_id_from_ed25519_pubkey(&kp1.verifying_key()).unwrap();
+        let pid2 = peer_id_from_ed25519_pubkey(&kp2.verifying_key()).unwrap();
+        assert_ne!(pid1, pid2);
+    }
+
+    // ---- SendMessage command tests ----
+
+    #[tokio::test]
+    async fn send_message_encrypts_and_dispatches() {
+        let sender_identity = Identity::generate();
+        let sender_kp = sender_identity.keypair().clone();
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "hello encrypted".into(),
+            tags: vec!["inbox".into(), "test".into()],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        // Run the loop with a keypair so SendMessage can encrypt.
+        run_loop(swarm, rx, None, None, Some(&sender_kp)).await;
+
+        // The reply should contain a valid message UUID.
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_ok(), "SendMessage should succeed: {:?}", result);
+        let msg_id = result.unwrap();
+        // UUID format: 8-4-4-4-12
+        assert_eq!(msg_id.len(), 36);
+        assert!(msg_id.contains('-'));
+    }
+
+    #[tokio::test]
+    async fn send_message_fails_without_keypair() {
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "test".into(),
+            tags: vec![],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        // No keypair provided.
+        run_loop(swarm, rx, None, None, None).await;
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no keypair"));
+    }
+
+    #[tokio::test]
+    async fn send_message_fails_with_invalid_recipient() {
+        let sender_kp = generate_keypair();
+
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: "not-valid-base64!!!".into(),
+            body: "test".into(),
+            tags: vec![],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, None, None, Some(&sender_kp)).await;
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid recipient"));
+    }
+
+    #[tokio::test]
+    async fn send_message_envelope_decryptable_by_recipient() {
+        // Verify the full roundtrip: send encrypts, then process_inbound_envelope decrypts.
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let recipient_pubkey = recipient_kp.verifying_key();
+        let recipient_peer_id = peer_id_from_ed25519_pubkey(&recipient_pubkey).unwrap();
+
+        // Simulate what the engine does in SendMessage:
+        let body = "secret roundtrip message";
+        let tags = vec!["private".to_string(), "important".to_string()];
+
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_pubkey);
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_pubkey, body.as_bytes()).unwrap();
+        let encrypted_tags: Vec<String> = tags
+            .iter()
+            .map(|t| {
+                let ct = encryption::seal(shared.as_bytes(), t.as_bytes()).unwrap();
+                b64.encode(&ct)
+            })
+            .collect();
+
+        let mut envelope = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        envelope.recipient = Some(recipient_peer_id);
+        envelope.tags = encrypted_tags;
+
+        let encoded = msg_codec::encode(&envelope, &sender_kp).unwrap();
+
+        // Now verify the recipient can decrypt it via process_inbound_envelope.
+        let store = MessageStore::open_memory().unwrap();
+        process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap();
+
+        let msgs = store.list_messages(0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, body);
+        assert_eq!(msgs[0].recipient, recipient_peer_id.to_string());
+
+        let stored_tags = store.get_message_tags(&envelope.id).unwrap();
+        assert_eq!(stored_tags, vec!["important", "private"]);
     }
 }

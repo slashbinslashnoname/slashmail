@@ -39,6 +39,9 @@ pub enum Command {
         /// Recipient public key (base64)
         #[arg(short, long)]
         to: String,
+        /// Message body
+        #[arg(short, long)]
+        body: String,
         /// Tags to attach to the message
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
@@ -225,6 +228,13 @@ struct AddPeerResult {
     addr: String,
 }
 
+/// JSON payload for send command.
+#[derive(Debug, Serialize)]
+struct SendResult {
+    message_id: String,
+    recipient: String,
+}
+
 /// JSON payload for messages list/search.
 #[derive(Debug, Serialize)]
 struct MessagesResult {
@@ -244,10 +254,43 @@ pub async fn run(args: Args) -> Result<()> {
             tracing::info!("showing status");
             init::status(&ctx).await
         }
-        Command::Send { .. } => {
-            // Write operations must route through the daemon command channel
-            // to avoid SQLITE_BUSY contention in WAL mode.
-            Err(AppError::DaemonRequired.into())
+        Command::Send { to, body, tags } => {
+            tracing::info!(%to, "sending message");
+            let resp = ctl::send_request(&CtlRequest::Send {
+                to: to.clone(),
+                body,
+                tags,
+            })
+            .await?;
+            match resp {
+                CtlResponse::Send {
+                    ok: true,
+                    message_id,
+                    ..
+                } => {
+                    let mid = message_id.unwrap_or_default();
+                    let result = SendResult {
+                        message_id: mid.clone(),
+                        recipient: to.clone(),
+                    };
+                    ctx.print_success(&result, || {
+                        println!("Message sent to {to} (id: {mid})");
+                    });
+                    Ok(())
+                }
+                CtlResponse::Send {
+                    ok: false, error, ..
+                } => {
+                    let msg = error.unwrap_or_else(|| "unknown error".into());
+                    anyhow::bail!("failed to send message: {msg}");
+                }
+                CtlResponse::Error { message } => {
+                    anyhow::bail!("daemon error: {message}");
+                }
+                _ => {
+                    anyhow::bail!("unexpected response from daemon");
+                }
+            }
         }
         Command::List { tag } => {
             tracing::info!(?tag, "listing messages");
