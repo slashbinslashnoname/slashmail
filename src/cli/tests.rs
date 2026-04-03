@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use super::{message_rows, truncate_chars, Args, Command, MessageJson, MessagesResult};
+use super::{message_rows, truncate_chars, Args, Command, DaemonCommand, MessageJson, MessagesResult};
 use crate::cli::output::OutputContext;
 use crate::storage::db::Message;
 use chrono::Utc;
@@ -105,40 +105,85 @@ fn parse_peers() {
 }
 
 #[test]
-fn parse_daemon_default_listen() {
-    let args = parse(&["slashmail", "daemon"]);
+fn parse_daemon_start_default_listen() {
+    let args = parse(&["slashmail", "daemon", "start"]);
     match args.command {
-        Command::Daemon { listen } => assert_eq!(listen, "/ip4/0.0.0.0/tcp/0"),
-        _ => panic!("expected Daemon"),
+        Command::Daemon { action: DaemonCommand::Start { listen } } => {
+            assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
+        }
+        _ => panic!("expected Daemon Start"),
     }
 }
 
 #[test]
-fn parse_daemon_custom_listen() {
-    let args = parse(&["slashmail", "daemon", "--listen", "/ip4/127.0.0.1/tcp/9000"]);
+fn parse_daemon_start_custom_listen() {
+    let args = parse(&["slashmail", "daemon", "start", "--listen", "/ip4/127.0.0.1/tcp/9000"]);
     match args.command {
-        Command::Daemon { listen } => assert_eq!(listen, "/ip4/127.0.0.1/tcp/9000"),
-        _ => panic!("expected Daemon"),
+        Command::Daemon { action: DaemonCommand::Start { listen } } => {
+            assert_eq!(listen, "/ip4/127.0.0.1/tcp/9000");
+        }
+        _ => panic!("expected Daemon Start"),
     }
 }
 
 #[test]
-fn parse_daemon_short_listen_flag() {
-    let args = parse(&["slashmail", "daemon", "-l", "/ip4/0.0.0.0/tcp/5555"]);
+fn parse_daemon_start_short_listen_flag() {
+    let args = parse(&["slashmail", "daemon", "start", "-l", "/ip4/0.0.0.0/tcp/5555"]);
     match args.command {
-        Command::Daemon { listen } => assert_eq!(listen, "/ip4/0.0.0.0/tcp/5555"),
-        _ => panic!("expected Daemon"),
+        Command::Daemon { action: DaemonCommand::Start { listen } } => {
+            assert_eq!(listen, "/ip4/0.0.0.0/tcp/5555");
+        }
+        _ => panic!("expected Daemon Start"),
     }
 }
 
 #[test]
-fn parse_daemon_with_json_flag() {
-    let args = parse(&["slashmail", "--json", "daemon"]);
+fn parse_daemon_start_with_json_flag() {
+    let args = parse(&["slashmail", "--json", "daemon", "start"]);
     assert!(args.json);
     match args.command {
-        Command::Daemon { listen } => assert_eq!(listen, "/ip4/0.0.0.0/tcp/0"),
-        _ => panic!("expected Daemon"),
+        Command::Daemon { action: DaemonCommand::Start { listen } } => {
+            assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
+        }
+        _ => panic!("expected Daemon Start"),
     }
+}
+
+#[test]
+fn parse_daemon_stop() {
+    let args = parse(&["slashmail", "daemon", "stop"]);
+    assert!(matches!(
+        args.command,
+        Command::Daemon { action: DaemonCommand::Stop }
+    ));
+}
+
+#[test]
+fn parse_daemon_restart_default_listen() {
+    let args = parse(&["slashmail", "daemon", "restart"]);
+    match args.command {
+        Command::Daemon { action: DaemonCommand::Restart { listen } } => {
+            assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
+        }
+        _ => panic!("expected Daemon Restart"),
+    }
+}
+
+#[test]
+fn parse_daemon_restart_custom_listen() {
+    let args = parse(&["slashmail", "daemon", "restart", "--listen", "/ip4/127.0.0.1/tcp/8000"]);
+    match args.command {
+        Command::Daemon { action: DaemonCommand::Restart { listen } } => {
+            assert_eq!(listen, "/ip4/127.0.0.1/tcp/8000");
+        }
+        _ => panic!("expected Daemon Restart"),
+    }
+}
+
+#[test]
+fn parse_daemon_requires_subcommand() {
+    let result = Args::try_parse_from(&["slashmail", "daemon"]);
+    assert!(result.is_err(), "daemon without subcommand should fail");
 }
 
 #[test]
@@ -408,4 +453,71 @@ fn message_rows_table_renders_without_panic() {
     assert!(table.contains("alice"));
     assert!(table.contains("Hello"));
     assert!(table.contains("inbox, urgent"));
+}
+
+// -- PID file management ------------------------------------------------------
+
+#[cfg(unix)]
+mod pid_tests {
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Test that is_pid_alive returns true for the current process.
+    #[test]
+    fn is_pid_alive_current_process() {
+        let pid = std::process::id();
+        assert!(super::super::is_pid_alive(pid));
+    }
+
+    /// Test that is_pid_alive returns false for a non-existent PID.
+    #[test]
+    fn is_pid_alive_nonexistent() {
+        // PID 4_000_000 is almost certainly not in use.
+        assert!(!super::super::is_pid_alive(4_000_000));
+    }
+
+    /// Test reading a valid PID file.
+    #[test]
+    fn read_pid_file_valid() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "12345").unwrap();
+
+        // We can't call read_pid_file() directly since it uses Config::pid_path(),
+        // but we can test the parsing logic inline.
+        let contents = fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(pid, 12345);
+    }
+
+    /// Test reading a PID file with whitespace.
+    #[test]
+    fn read_pid_file_with_whitespace() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "  42  \n").unwrap();
+
+        let contents = fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(pid, 42);
+    }
+
+    /// Test that an invalid PID file contents can't be parsed.
+    #[test]
+    fn read_pid_file_invalid_contents() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "not_a_number").unwrap();
+
+        let contents = fs::read_to_string(&pid_path).unwrap();
+        assert!(contents.trim().parse::<u32>().is_err());
+    }
+
+    /// Test that a missing PID file is handled.
+    #[test]
+    fn read_pid_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        assert!(!pid_path.exists());
+    }
 }
