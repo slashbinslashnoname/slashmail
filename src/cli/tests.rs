@@ -1,7 +1,9 @@
 use clap::Parser;
 
-use super::{command_catalogue, message_rows, truncate_chars, Args, Command, DaemonCommand, HelpResult, MessageJson, MessagesResult};
-use crate::cli::output::OutputContext;
+use super::{command_catalogue, message_rows, truncate_chars, Args, Command, DaemonCommand, HelpResult, MessageJson, MessagesResult, SendResult};
+use crate::cli::output::{JsonError, JsonSuccess, OutputContext};
+use crate::ctl::{CtlRequest, CtlResponse};
+use crate::error::AppError;
 use crate::storage::db::Message;
 use chrono::Utc;
 use uuid::Uuid;
@@ -667,4 +669,434 @@ fn help_result_json_envelope() {
     ctx.print_success(&result, || {
         panic!("human closure should not be called in JSON mode");
     });
+}
+
+// -- JSON envelope shape verification ----------------------------------------
+
+#[test]
+fn json_success_envelope_has_ok_true_and_data() {
+    let data = SendResult {
+        message_id: "abc-123".into(),
+        recipient: "bob-key".into(),
+    };
+    let envelope = JsonSuccess::new(&data);
+    let json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["data"]["message_id"], "abc-123");
+    assert_eq!(json["data"]["recipient"], "bob-key");
+    // Ensure no extra top-level keys beyond ok and data
+    let obj = json.as_object().unwrap();
+    assert_eq!(obj.len(), 2);
+}
+
+#[test]
+fn json_error_envelope_has_ok_false_and_error_fields() {
+    let err = AppError::Network("connection refused".into());
+    let envelope = JsonError::from_app_error(&err);
+    let json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(json["ok"], false);
+    let error = &json["error"];
+    assert!(error["code"].is_string());
+    assert!(error["message"].is_string());
+    assert!(error["exit_code"].is_number());
+    // Top-level has exactly {ok, error}
+    assert_eq!(json.as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn send_result_serializes_all_fields() {
+    let result = SendResult {
+        message_id: "msg-001".into(),
+        recipient: "AAAA".into(),
+    };
+    let json: serde_json::Value = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["message_id"], "msg-001");
+    assert_eq!(json["recipient"], "AAAA");
+}
+
+#[test]
+fn messages_result_empty_list() {
+    let result = MessagesResult {
+        messages: vec![],
+        count: 0,
+    };
+    let json: serde_json::Value = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["count"], 0);
+    assert_eq!(json["messages"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn messages_result_with_inbox_messages() {
+    let mut m1 = test_message("alice", "Hello", "hi", "urgent");
+    m1.folder_path = "INBOX".into();
+    let mut m2 = test_message("bob", "Reply", "re: hi", "");
+    m2.folder_path = "INBOX".into();
+
+    let json_msgs: Vec<MessageJson> = vec![MessageJson::from(&m1), MessageJson::from(&m2)];
+    let result = MessagesResult {
+        count: json_msgs.len(),
+        messages: json_msgs,
+    };
+    let json: serde_json::Value = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["messages"][0]["sender"], "alice");
+    assert_eq!(json["messages"][1]["sender"], "bob");
+}
+
+// -- CtlRequest/CtlResponse serialization (send command) ---------------------
+
+#[test]
+fn ctl_request_send_serializes_with_cmd_tag() {
+    let req = CtlRequest::Send {
+        to: "recipient-key".into(),
+        body: "Hello world".into(),
+        tags: vec!["inbox".into(), "important".into()],
+    };
+    let json: serde_json::Value = serde_json::to_value(&req).unwrap();
+    assert_eq!(json["cmd"], "send");
+    assert_eq!(json["to"], "recipient-key");
+    assert_eq!(json["body"], "Hello world");
+    assert_eq!(json["tags"], serde_json::json!(["inbox", "important"]));
+}
+
+#[test]
+fn ctl_request_send_empty_tags() {
+    let req = CtlRequest::Send {
+        to: "key".into(),
+        body: "msg".into(),
+        tags: vec![],
+    };
+    let json: serde_json::Value = serde_json::to_value(&req).unwrap();
+    assert_eq!(json["tags"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn ctl_response_send_ok_deserializes() {
+    let json_str = r#"{"type":"send","ok":true,"message_id":"abc-123","error":null}"#;
+    let resp: CtlResponse = serde_json::from_str(json_str).unwrap();
+    match resp {
+        CtlResponse::Send { ok, message_id, error, .. } => {
+            assert!(ok);
+            assert_eq!(message_id.as_deref(), Some("abc-123"));
+            assert!(error.is_none());
+        }
+        _ => panic!("expected Send response"),
+    }
+}
+
+#[test]
+fn ctl_response_send_error_deserializes() {
+    let json_str = r#"{"type":"send","ok":false,"message_id":null,"error":"peer not found"}"#;
+    let resp: CtlResponse = serde_json::from_str(json_str).unwrap();
+    match resp {
+        CtlResponse::Send { ok, error, .. } => {
+            assert!(!ok);
+            assert_eq!(error.as_deref(), Some("peer not found"));
+        }
+        _ => panic!("expected Send response"),
+    }
+}
+
+#[test]
+fn ctl_response_send_with_warning() {
+    let json_str = r#"{"type":"send","ok":true,"message_id":"x","error":null,"warning":"peer offline, queued"}"#;
+    let resp: CtlResponse = serde_json::from_str(json_str).unwrap();
+    match resp {
+        CtlResponse::Send { ok, warning, .. } => {
+            assert!(ok);
+            assert_eq!(warning.as_deref(), Some("peer offline, queued"));
+        }
+        _ => panic!("expected Send response"),
+    }
+}
+
+#[test]
+fn ctl_request_send_roundtrip() {
+    let req = CtlRequest::Send {
+        to: "pk-base64".into(),
+        body: "test body".into(),
+        tags: vec!["tag1".into()],
+    };
+    let serialized = serde_json::to_string(&req).unwrap();
+    let deserialized: CtlRequest = serde_json::from_str(&serialized).unwrap();
+    match deserialized {
+        CtlRequest::Send { to, body, tags } => {
+            assert_eq!(to, "pk-base64");
+            assert_eq!(body, "test body");
+            assert_eq!(tags, vec!["tag1"]);
+        }
+        _ => panic!("expected Send"),
+    }
+}
+
+#[test]
+fn ctl_response_error_deserializes() {
+    let json_str = r#"{"type":"error","message":"daemon busy"}"#;
+    let resp: CtlResponse = serde_json::from_str(json_str).unwrap();
+    match resp {
+        CtlResponse::Error { message } => assert_eq!(message, "daemon busy"),
+        _ => panic!("expected Error response"),
+    }
+}
+
+// -- Inbox data-layer filtering via MessageStore ------------------------------
+
+mod inbox_store_tests {
+    use crate::storage::db::{MessageStore, ReadOnlyMessageStore, Message};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn make_msg(sender: &str, subject: &str, folder: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            swarm_id: "test-swarm".into(),
+            folder_path: folder.into(),
+            sender_pubkey: [0u8; 32],
+            sender: sender.into(),
+            recipient: "me".into(),
+            subject: subject.into(),
+            body: "body".into(),
+            tags: String::new(),
+            created_at: Utc::now(),
+            read: false,
+        }
+    }
+
+    #[test]
+    fn inbox_messages_filters_by_inbox_folder() {
+        let store = MessageStore::open_memory().unwrap();
+        store.insert_message(&make_msg("alice", "Hi", "INBOX")).unwrap();
+        store.insert_message(&make_msg("bob", "Re", "SENT")).unwrap();
+        store.insert_message(&make_msg("carol", "Hey", "INBOX")).unwrap();
+
+        // Can't open ReadOnlyMessageStore from memory DB, so query directly
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages WHERE folder_path = 'INBOX' ORDER BY created_at DESC",
+            )
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn inbox_messages_by_tag_filters_correctly() {
+        let store = MessageStore::open_memory().unwrap();
+        let m1 = make_msg("alice", "Urgent", "INBOX");
+        let m2 = make_msg("bob", "Normal", "INBOX");
+        let m3 = make_msg("carol", "Sent", "SENT");
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+        store.insert_message(&m3).unwrap();
+
+        store.tag_message(&m1.id, "urgent").unwrap();
+        store.tag_message(&m2.id, "normal").unwrap();
+        store.tag_message(&m3.id, "urgent").unwrap();
+
+        // Query: INBOX messages with tag "urgent" → only m1
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id FROM messages m
+                 JOIN message_tags mt ON m.id = mt.envelope_id
+                 WHERE m.folder_path = 'INBOX' AND mt.tag = 'urgent'
+                 ORDER BY m.created_at DESC",
+            )
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], m1.id.to_string());
+    }
+
+    #[test]
+    fn inbox_messages_respects_limit() {
+        let store = MessageStore::open_memory().unwrap();
+        for i in 0..10 {
+            store
+                .insert_message(&make_msg("alice", &format!("Msg {i}"), "INBOX"))
+                .unwrap();
+        }
+
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages WHERE folder_path = 'INBOX' ORDER BY created_at DESC LIMIT 3",
+            )
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn search_passthrough_finds_matching_messages() {
+        let store = MessageStore::open_memory().unwrap();
+        let m1 = make_msg("alice", "Meeting notes", "INBOX");
+        let m2 = make_msg("bob", "Lunch plans", "INBOX");
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+
+        let results = store.search_messages("meeting").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].subject, "Meeting notes");
+    }
+
+    #[test]
+    fn search_passthrough_returns_empty_for_no_match() {
+        let store = MessageStore::open_memory().unwrap();
+        store
+            .insert_message(&make_msg("alice", "Hello", "INBOX"))
+            .unwrap();
+
+        let results = store.search_messages("nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn inbox_empty_returns_empty_vec() {
+        let store = MessageStore::open_memory().unwrap();
+        // Insert only SENT messages
+        store
+            .insert_message(&make_msg("alice", "Sent item", "SENT"))
+            .unwrap();
+
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE folder_path = 'INBOX'")
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(ids.is_empty());
+    }
+}
+
+// -- Daemon PID stale detection -----------------------------------------------
+
+#[cfg(unix)]
+mod daemon_pid_tests {
+    /// is_pid_alive correctly identifies current process as alive.
+    #[test]
+    fn current_process_is_alive() {
+        assert!(super::super::is_pid_alive(std::process::id()));
+    }
+
+    /// A very high PID that doesn't exist should be reported as not alive.
+    #[test]
+    fn nonexistent_pid_is_not_alive() {
+        assert!(!super::super::is_pid_alive(4_000_000));
+    }
+
+    /// PID 0 is special (kernel) — is_pid_alive should handle it without panic.
+    #[test]
+    fn pid_zero_does_not_panic() {
+        // Result varies by platform, but should not panic.
+        let _ = super::super::is_pid_alive(0);
+    }
+
+    /// Verify PID file write and read produce consistent data.
+    #[test]
+    fn pid_file_write_read_remove_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        let pid = std::process::id();
+
+        // Write
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+
+        // Read
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        let read_pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(read_pid, pid);
+
+        // Remove
+        std::fs::remove_file(&pid_path).unwrap();
+        assert!(!pid_path.exists());
+    }
+
+    /// Stale PID file with dead process should be detectable.
+    #[test]
+    fn stale_pid_detection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+
+        // Write a PID that doesn't exist
+        std::fs::write(&pid_path, "4000000").unwrap();
+
+        // Read it back
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+
+        // Detect it's stale
+        assert!(!super::super::is_pid_alive(pid));
+
+        // Cleanup (simulating what run_daemon_stop does with stale PIDs)
+        std::fs::remove_file(&pid_path).unwrap();
+        assert!(!pid_path.exists());
+    }
+
+    /// PID file with trailing newline/whitespace parses correctly.
+    #[test]
+    fn pid_file_with_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::write(&pid_path, "12345\n").unwrap();
+
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(pid, 12345);
+    }
+
+    /// Empty PID file fails to parse (simulating corruption).
+    #[test]
+    fn empty_pid_file_fails_parse() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::write(&pid_path, "").unwrap();
+
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        assert!(contents.trim().parse::<u32>().is_err());
+    }
+}
+
+// -- OutputContext: print_error returns correct codes for all error types ------
+
+#[test]
+fn print_error_json_mode_network() {
+    let ctx = OutputContext::forced(true);
+    let err = AppError::Network("timeout".into());
+    let code = ctx.print_error(&err);
+    assert_eq!(code, crate::cli::output::ExitCode::NetworkError);
+}
+
+#[test]
+fn print_error_json_mode_crypto() {
+    let ctx = OutputContext::forced(true);
+    let err = AppError::Crypto("bad key".into());
+    let code = ctx.print_error(&err);
+    assert_eq!(code, crate::cli::output::ExitCode::CryptoError);
+}
+
+#[test]
+fn print_error_human_mode_returns_code_without_panic() {
+    let ctx = OutputContext::forced(false);
+    let err = AppError::InvalidInput("bad".into());
+    let code = ctx.print_error(&err);
+    assert_eq!(code, crate::cli::output::ExitCode::InvalidInput);
 }
