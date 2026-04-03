@@ -60,6 +60,21 @@ pub enum Command {
     },
 }
 
+/// Row type for the message table output (list / search).
+#[derive(Tabled)]
+struct MessageRow {
+    #[tabled(rename = "From")]
+    sender: String,
+    #[tabled(rename = "Subject")]
+    subject: String,
+    #[tabled(rename = "Tags")]
+    tags: String,
+    #[tabled(rename = "Date")]
+    timestamp: String,
+    #[tabled(rename = "Preview")]
+    preview: String,
+}
+
 /// Row type for the peers table output.
 #[derive(Tabled)]
 struct PeerRow {
@@ -73,6 +88,59 @@ struct PeerRow {
     protocols: String,
     #[tabled(rename = "RTT (ms)")]
     rtt: String,
+}
+
+/// Truncate a string to at most `max_chars` characters, appending `…` if truncated.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Convert a slice of messages into table rows for display.
+fn message_rows(messages: &[crate::storage::db::Message]) -> Vec<MessageRow> {
+    messages
+        .iter()
+        .map(|msg| {
+            // Truncate sender for display
+            let sender = truncate_chars(&msg.sender, 19);
+            // Truncate subject
+            let subject = truncate_chars(&msg.subject, 29);
+            // Tags: replace spaces with ", " for readability
+            let tags = if msg.tags.is_empty() {
+                "-".into()
+            } else {
+                msg.tags.split_whitespace().collect::<Vec<_>>().join(", ")
+            };
+            // Preview: first 40 chars of body
+            let preview = if msg.body.is_empty() {
+                "-".into()
+            } else {
+                truncate_chars(&msg.body, 39)
+            };
+            MessageRow {
+                sender,
+                subject,
+                tags,
+                timestamp: msg.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                preview,
+            }
+        })
+        .collect()
+}
+
+/// Print a formatted table of messages, or a "no messages" notice.
+fn print_message_table(messages: &[crate::storage::db::Message], empty_msg: &str) {
+    if messages.is_empty() {
+        println!("{empty_msg}");
+    } else {
+        let rows = message_rows(messages);
+        println!("{}", Table::new(rows));
+    }
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -102,19 +170,7 @@ pub async fn run(args: Args) -> Result<()> {
                 Some(ref t) => store.messages_by_tag(t)?,
                 None => store.list_messages(50)?,
             };
-            if messages.is_empty() {
-                println!("No messages found.");
-            } else {
-                for msg in &messages {
-                    println!(
-                        "{} | {} → {} | {}",
-                        msg.created_at.format("%Y-%m-%d %H:%M"),
-                        msg.sender,
-                        msg.recipient,
-                        msg.subject,
-                    );
-                }
-            }
+            print_message_table(&messages, "No messages found.");
             Ok(())
         }
         Command::Search { ref query } => {
@@ -126,19 +182,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
             let store = ReadOnlyMessageStore::open(&db_path)?;
             let results = store.search_messages(query)?;
-            if results.is_empty() {
-                println!("No messages match \"{}\".", query);
-            } else {
-                for msg in &results {
-                    println!(
-                        "{} | {} → {} | {}",
-                        msg.created_at.format("%Y-%m-%d %H:%M"),
-                        msg.sender,
-                        msg.recipient,
-                        msg.subject,
-                    );
-                }
-            }
+            print_message_table(&results, &format!("No messages match \"{query}\"."));
             Ok(())
         }
         Command::AddPeer { addr } => {
@@ -176,11 +220,7 @@ pub async fn run(args: Args) -> Result<()> {
                             .into_iter()
                             .map(|p| {
                                 // Truncate PeerId for display (keep first 16 chars + ...)
-                                let short_id = if p.peer_id.len() > 16 {
-                                    format!("{}...", &p.peer_id[..16])
-                                } else {
-                                    p.peer_id
-                                };
+                                let short_id = truncate_chars(&p.peer_id, 16);
                                 PeerRow {
                                     peer_id: short_id,
                                     addrs: if p.addrs.is_empty() {
