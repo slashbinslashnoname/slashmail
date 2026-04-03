@@ -20,6 +20,9 @@ use crate::crypto::encryption;
 use crate::crypto::signing::{self, Keypair, PublicKey};
 use crate::message::codec as msg_codec;
 use crate::net::behaviour::{SlashmailBehaviour, SlashmailBehaviourEvent};
+use crate::net::peer_exchange::{
+    self, PeerExchangeRequest, PeerExchangeResponse,
+};
 use crate::net::rr::{MailRequest, MailResponse};
 use crate::storage::db::{Message, MessageStore};
 
@@ -358,6 +361,19 @@ enum SwarmAction {
         channel: request_response::ResponseChannel<MailResponse>,
         response: MailResponse,
     },
+    /// Initiate a peer exchange with a newly connected peer.
+    InitiatePeerExchange {
+        peer_id: libp2p::PeerId,
+    },
+    /// Send a peer exchange response and dial received peers.
+    PeerExchangeRespond {
+        channel: request_response::ResponseChannel<PeerExchangeResponse>,
+        peers_received: Vec<peer_exchange::PeerInfo>,
+    },
+    /// Dial peers learned from a peer exchange response.
+    PeerExchangeLearn {
+        peers_received: Vec<peer_exchange::PeerInfo>,
+    },
 }
 
 /// Apply a [`SwarmAction`] to the swarm.
@@ -376,6 +392,103 @@ fn apply_swarm_action(
             {
                 warn!("failed to send response on request-response channel");
             }
+        }
+        SwarmAction::InitiatePeerExchange { peer_id } => {
+            let table = collect_peer_table(swarm);
+            let req = PeerExchangeRequest { peers: table };
+            swarm
+                .behaviour_mut()
+                .peer_exchange
+                .send_request(&peer_id, req);
+            debug!(%peer_id, "sent peer exchange request");
+        }
+        SwarmAction::PeerExchangeRespond {
+            channel,
+            peers_received,
+        } => {
+            let table = collect_peer_table(swarm);
+            let resp = PeerExchangeResponse { peers: table };
+            if swarm
+                .behaviour_mut()
+                .peer_exchange
+                .send_response(channel, resp)
+                .is_err()
+            {
+                warn!("failed to send peer exchange response");
+            }
+            dial_learned_peers(swarm, &peers_received);
+        }
+        SwarmAction::PeerExchangeLearn { peers_received } => {
+            dial_learned_peers(swarm, &peers_received);
+        }
+    }
+}
+
+/// Collect the current peer routing table from the swarm's connected peers
+/// and their known/listened addresses.
+fn collect_peer_table(swarm: &mut Swarm<SlashmailBehaviour>) -> Vec<peer_exchange::PeerInfo> {
+    let local_peer_id = *swarm.local_peer_id();
+    let mut table = Vec::new();
+
+    // Gather addresses from Kademlia's routing table for connected peers.
+    let connected: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
+    for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+        for entry in bucket.iter() {
+            let peer_id = *entry.node.key.preimage();
+            if peer_id == local_peer_id || !connected.contains(&peer_id) {
+                continue;
+            }
+            let addrs: Vec<libp2p::Multiaddr> = entry.node.value.iter().cloned().collect();
+            if !addrs.is_empty() {
+                table.push(peer_exchange::to_peer_info(&peer_id, &addrs));
+            }
+        }
+    }
+
+    // Include our own external and listen addresses merged under one entry,
+    // so the receiver gets a single canonical record for our peer ID.
+    let mut own_addrs: Vec<libp2p::Multiaddr> = swarm.external_addresses().cloned().collect();
+    own_addrs.extend(swarm.listeners().cloned());
+    own_addrs.dedup();
+    if !own_addrs.is_empty() {
+        table.push(peer_exchange::to_peer_info(&local_peer_id, &own_addrs));
+    }
+
+    table
+}
+
+/// Dial peers learned from a peer exchange, skipping already-connected peers.
+fn dial_learned_peers(swarm: &mut Swarm<SlashmailBehaviour>, peers: &[peer_exchange::PeerInfo]) {
+    let local_peer_id = *swarm.local_peer_id();
+    let connected: std::collections::HashSet<libp2p::PeerId> =
+        swarm.connected_peers().copied().collect();
+
+    for info in peers {
+        if let Some((peer_id, addrs)) = peer_exchange::from_peer_info(info) {
+            if peer_id == local_peer_id || connected.contains(&peer_id) {
+                continue;
+            }
+            if addrs.is_empty() {
+                continue;
+            }
+            // Add addresses to Kademlia so they're available for future lookups.
+            for addr in &addrs {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+            }
+            // Dial the first address.
+            match swarm.dial(addrs[0].clone()) {
+                Ok(()) => {
+                    info!(%peer_id, addr = %addrs[0], "dialing peer learned from exchange");
+                }
+                Err(e) => {
+                    debug!(%peer_id, %e, "failed to dial learned peer");
+                }
+            }
+        } else {
+            debug!("skipping malformed peer info in exchange");
         }
     }
 }
@@ -403,6 +516,11 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::Gossipsub(gs_event)) => {
             handle_gossipsub_event(gs_event, keypair, store);
             SwarmAction::None
+        }
+
+        // --- Peer exchange events ---
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::PeerExchange(px_event)) => {
+            handle_peer_exchange_event(px_event)
         }
 
         // --- Identify events (peer metadata) ---
@@ -451,8 +569,15 @@ fn handle_swarm_event(
             info!(%address, "new listen address");
             SwarmAction::None
         }
-        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            num_established,
+            ..
+        } => {
             info!(%peer_id, "connection established");
+            // Only initiate peer exchange on the first connection to avoid
+            // duplicate exchanges when dcutr upgrades a relay connection to
+            // a direct one (which fires a second ConnectionEstablished).
             if num_established.get() == 1 {
                 peers.insert(peer_id, PeerState {
                     connected_since: Utc::now(),
@@ -460,8 +585,10 @@ fn handle_swarm_event(
                     listen_addrs: Vec::new(),
                     rtt: None,
                 });
+                SwarmAction::InitiatePeerExchange { peer_id }
+            } else {
+                SwarmAction::None
             }
-            SwarmAction::None
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             debug!(%peer_id, "connection closed");
@@ -627,6 +754,50 @@ fn handle_gossipsub_event(
         }
         gossipsub::Event::GossipsubNotSupported { peer_id } => {
             debug!(%peer_id, "gossipsub not supported by peer");
+        }
+    }
+}
+
+/// Handle peer exchange request-response events.
+///
+/// On inbound request: respond with our routing table and prepare to dial
+/// the received peers. On response to our outbound request: dial any new peers.
+fn handle_peer_exchange_event(
+    event: request_response::Event<PeerExchangeRequest, PeerExchangeResponse>,
+) -> SwarmAction {
+    match event {
+        request_response::Event::Message { message, peer, .. } => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                info!(%peer, peers_received = request.peers.len(), "peer exchange request received");
+                SwarmAction::PeerExchangeRespond {
+                    channel,
+                    peers_received: request.peers,
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                info!(%peer, peers_received = response.peers.len(), "peer exchange response received");
+                SwarmAction::PeerExchangeLearn {
+                    peers_received: response.peers,
+                }
+            }
+        },
+        request_response::Event::OutboundFailure {
+            peer, error, ..
+        } => {
+            debug!(%peer, %error, "peer exchange outbound failure");
+            SwarmAction::None
+        }
+        request_response::Event::InboundFailure {
+            peer, error, ..
+        } => {
+            debug!(%peer, %error, "peer exchange inbound failure");
+            SwarmAction::None
+        }
+        request_response::Event::ResponseSent { peer, .. } => {
+            debug!(%peer, "peer exchange response sent");
+            SwarmAction::None
         }
     }
 }
@@ -1359,5 +1530,121 @@ mod tests {
         // With no peers the publish may succeed (message stored locally) or fail
         // depending on gossipsub config. Either way it must not panic.
         let _result = reply_rx.await.unwrap();
+    }
+
+    // ---- Peer exchange tests ----
+
+    #[test]
+    fn collect_peer_table_empty_swarm() {
+        // A freshly built swarm with no connected peers should produce
+        // at most entries for our own addresses (if listening).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, _peer_id) = build_swarm(&identity).await.unwrap();
+            let table = collect_peer_table(&mut swarm);
+            // No connected peers and not listening, so table should be empty.
+            assert!(table.is_empty());
+        });
+    }
+
+    #[test]
+    fn collect_peer_table_includes_listen_addrs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, peer_id) = build_swarm(&identity).await.unwrap();
+
+            // Start listening to get a listen address.
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+
+            // Poll once to process the listen event.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                swarm.select_next_some(),
+            )
+            .await;
+
+            let table = collect_peer_table(&mut swarm);
+            // Should include our own listen addresses.
+            let own_entries: Vec<_> = table
+                .iter()
+                .filter(|info| {
+                    peer_exchange::from_peer_info(*info)
+                        .map(|(pid, _)| pid == peer_id)
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                !own_entries.is_empty(),
+                "peer table should include own listen addresses"
+            );
+        });
+    }
+
+    #[test]
+    fn dial_learned_peers_skips_self() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, peer_id) = build_swarm(&identity).await.unwrap();
+
+            // Create a PeerInfo for ourselves — should be skipped.
+            let self_info = peer_exchange::to_peer_info(
+                &peer_id,
+                &["/ip4/127.0.0.1/tcp/9999".parse().unwrap()],
+            );
+            // Should not panic or attempt to dial self.
+            dial_learned_peers(&mut swarm, &[self_info]);
+        });
+    }
+
+    #[test]
+    fn dial_learned_peers_skips_empty_addrs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, _) = build_swarm(&identity).await.unwrap();
+
+            let remote_id = libp2p::PeerId::random();
+            let info = peer_exchange::to_peer_info(&remote_id, &[]);
+            // Should skip peers with no addresses.
+            dial_learned_peers(&mut swarm, &[info]);
+        });
+    }
+
+    #[test]
+    fn dial_learned_peers_dials_new_peer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, _) = build_swarm(&identity).await.unwrap();
+
+            let remote_id = libp2p::PeerId::random();
+            let info = peer_exchange::to_peer_info(
+                &remote_id,
+                &["/ip4/127.0.0.1/tcp/19999".parse().unwrap()],
+            );
+            // Should attempt to dial (won't connect, but shouldn't panic).
+            dial_learned_peers(&mut swarm, &[info]);
+        });
+    }
+
+    #[test]
+    fn dial_learned_peers_skips_malformed_peer_info() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let identity = Identity::generate();
+            let (mut swarm, _) = build_swarm(&identity).await.unwrap();
+
+            let bad_info = peer_exchange::PeerInfo {
+                peer_id: vec![0xFF, 0xFF],
+                addrs: vec![],
+            };
+            // Should skip malformed entries without panicking.
+            dial_learned_peers(&mut swarm, &[bad_info]);
+        });
     }
 }

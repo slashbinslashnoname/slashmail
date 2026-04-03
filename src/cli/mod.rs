@@ -230,6 +230,7 @@ async fn run_daemon(listen: String) -> Result<()> {
     use tokio::sync::mpsc;
 
     let identity = Identity::load_from_keyring()?;
+    let config = Config::load()?;
     let (mut swarm, peer_id) = net::build_swarm(&identity).await?;
 
     let listen_addr: Multiaddr = listen
@@ -238,6 +239,19 @@ async fn run_daemon(listen: String) -> Result<()> {
     swarm
         .listen_on(listen_addr)
         .map_err(|e| anyhow::anyhow!("failed to listen: {e}"))?;
+
+    // When relay_addr is configured, listen through the relay so that
+    // dcutr can hole-punch connections for NATed peers.
+    if let Some(ref relay) = config.relay_addr {
+        let relay_addr: Multiaddr = relay
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid relay_addr in config: {e}"))?;
+        let relay_listen = relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+        swarm
+            .listen_on(relay_listen)
+            .map_err(|e| anyhow::anyhow!("failed to listen on relay: {e}"))?;
+        println!("Relay:   {relay}");
+    }
 
     println!("PeerId:  {peer_id}");
     println!("Daemon running. Press Ctrl-C to stop.");

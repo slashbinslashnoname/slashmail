@@ -1,6 +1,7 @@
 //! Networking layer: libp2p transport, behaviour, and swarm construction.
 
 pub mod behaviour;
+pub mod peer_exchange;
 pub mod rr;
 pub mod transport;
 
