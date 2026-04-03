@@ -159,12 +159,19 @@ impl Config {
     /// Add a multiaddr to the bootstrap peers list if not already present,
     /// then persist the config. Returns `true` if the peer was newly added.
     pub fn add_bootstrap_peer(addr: &str) -> Result<bool, AppError> {
-        let mut cfg = Self::load()?;
+        let path = Self::config_path()?;
+        Self::add_bootstrap_peer_to(addr, &path)
+    }
+
+    /// Like [`add_bootstrap_peer`] but operates on an arbitrary path.
+    /// Useful for testing.
+    pub fn add_bootstrap_peer_to(addr: &str, path: &Path) -> Result<bool, AppError> {
+        let mut cfg = Self::load_from(path)?;
         if cfg.bootstrap_peers.iter().any(|a| a == addr) {
             return Ok(false);
         }
         cfg.bootstrap_peers.push(addr.to_string());
-        cfg.save()?;
+        cfg.save_to(path)?;
         Ok(true)
     }
 
@@ -536,5 +543,30 @@ bootstrap_peers = [
         assert_eq!(cfg.bootstrap_peers.len(), 2);
         assert_eq!(cfg.bootstrap_peers[0], "/ip4/1.2.3.4/tcp/4001");
         assert_eq!(cfg.bootstrap_peers[1], "/ip4/10.0.0.1/tcp/5000");
+    }
+
+    #[test]
+    fn add_bootstrap_peer_to_adds_and_deduplicates() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        // First add: returns true and persists.
+        let added = Config::add_bootstrap_peer_to("/ip4/1.2.3.4/tcp/4001", &path).unwrap();
+        assert!(added);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.bootstrap_peers, vec!["/ip4/1.2.3.4/tcp/4001"]);
+
+        // Second add of the same addr: returns false, no duplicate.
+        let added = Config::add_bootstrap_peer_to("/ip4/1.2.3.4/tcp/4001", &path).unwrap();
+        assert!(!added);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.bootstrap_peers.len(), 1);
+
+        // Different addr: returns true and appends.
+        let added = Config::add_bootstrap_peer_to("/ip4/5.6.7.8/tcp/9000", &path).unwrap();
+        assert!(added);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.bootstrap_peers.len(), 2);
+        assert_eq!(cfg.bootstrap_peers[1], "/ip4/5.6.7.8/tcp/9000");
     }
 }
