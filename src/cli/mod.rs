@@ -474,6 +474,7 @@ async fn run_daemon_stop() -> Result<()> {
 }
 
 /// Start the P2P daemon: load identity, build swarm, open control socket, run event loop.
+#[cfg(unix)]
 async fn run_daemon_start(listen: String) -> Result<()> {
     use crate::engine;
     use crate::identity::Identity;
