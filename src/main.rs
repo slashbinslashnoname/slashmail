@@ -2,6 +2,7 @@ mod cli;
 mod compress;
 mod crypto;
 mod db;
+mod engine;
 mod error;
 mod identity;
 mod keystore;
