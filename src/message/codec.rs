@@ -1,5 +1,6 @@
 //! Binary codec for message envelopes: bincode serialization + zstd compression.
-//! Encode signs the payload; decode preserves the signature for caller verification.
+//! Encode signs the full envelope (all fields except signature); decode preserves
+//! the signature for caller verification.
 //!
 //! Wire format: `[version_byte | compressed_bincode...]`
 //! Version 1 is the current format.
@@ -13,13 +14,13 @@ use crate::types::Envelope;
 /// Current codec version. Bumped on breaking bincode layout changes.
 pub const CODEC_VERSION: u8 = 1;
 
-/// Encode an [`Envelope`] to bytes (sign payload, bincode, zstd, version prefix).
+/// Encode an [`Envelope`] to bytes (sign full envelope, bincode, zstd, version prefix).
 ///
-/// Signs the payload with the given keypair and stores the 64-byte Ed25519
-/// signature in the envelope before serialization.
+/// Signs all envelope fields (via [`Envelope::signable_bytes`]) with the given
+/// keypair and stores the 64-byte Ed25519 signature before serialization.
 pub fn encode(envelope: &Envelope, keypair: &Keypair) -> Result<Vec<u8>> {
     let mut signed = envelope.clone();
-    let sig = signing::sign(keypair, &signed.payload);
+    let sig = signing::sign(keypair, &signed.signable_bytes());
     signed.signature = sig.to_bytes().to_vec();
     let bin = bincode::serialize(&signed)?;
     let compressed = compress::compress(&bin)?;
@@ -111,7 +112,7 @@ mod tests {
         let decoded = decode(&encoded).unwrap();
 
         let sig = Signature::from_slice(&decoded.signature).unwrap();
-        assert!(sign::verify(&kp.verifying_key(), &decoded.payload, &sig).is_ok());
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_ok());
     }
 
     #[test]
@@ -125,7 +126,78 @@ mod tests {
         decoded.payload = vec![0xFF; 4]; // tamper
 
         let sig = Signature::from_slice(&decoded.signature).unwrap();
-        assert!(sign::verify(&kp.verifying_key(), &decoded.payload, &sig).is_err());
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_tampered_recipient() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        decoded.recipient = Some(PeerId::random()); // tamper metadata
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_tampered_swarm_id() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        decoded.swarm_id = "evil-swarm".into(); // tamper metadata
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_tampered_timestamp() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        decoded.timestamp = Utc::now() + chrono::Duration::hours(1); // tamper metadata
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_tampered_tags() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+        envelope.tags = vec!["original".into()];
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        decoded.tags = vec!["injected".into()]; // tamper metadata
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_tampered_id() {
+        let kp = generate_keypair();
+        let mut envelope = sample_envelope();
+        envelope.sender_pubkey = kp.verifying_key().to_bytes();
+
+        let encoded = encode(&envelope, &kp).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        decoded.id = Uuid::new_v4(); // tamper metadata
+
+        let sig = Signature::from_slice(&decoded.signature).unwrap();
+        assert!(sign::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig).is_err());
     }
 
     #[test]

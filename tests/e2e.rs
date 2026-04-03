@@ -55,7 +55,7 @@ fn send_to_inbox_roundtrip_public_message() {
     assert_eq!(decoded.timestamp, original_ts);
 
     let sig = Signature::from_slice(&decoded.signature).expect("valid signature bytes");
-    signing::verify(&kp.verifying_key(), &decoded.payload, &sig)
+    signing::verify(&kp.verifying_key(), &decoded.signable_bytes(), &sig)
         .expect("signature should verify");
 
     // Store the decoded envelope as a Message in the database.
@@ -291,7 +291,7 @@ async fn two_swarm_gossipsub_publish_and_receive() {
 
     // Verify signature.
     let sig = Signature::from_slice(&decoded.signature).unwrap();
-    signing::verify(&kp_a.verifying_key(), &decoded.payload, &sig)
+    signing::verify(&kp_a.verifying_key(), &decoded.signable_bytes(), &sig)
         .expect("signature from gossipsub message should verify");
 }
 

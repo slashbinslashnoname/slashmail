@@ -21,7 +21,7 @@ pub struct Envelope {
     pub swarm_id: String,
     /// Opaque message payload (cleartext or ciphertext depending on pipeline stage).
     pub payload: Vec<u8>,
-    /// Ed25519 signature over the payload (64 bytes when signed, empty before signing).
+    /// Ed25519 signature over the full envelope (64 bytes when signed, empty before signing).
     pub signature: Vec<u8>,
     /// When the envelope was created.
     pub timestamp: DateTime<Utc>,
@@ -44,6 +44,22 @@ impl Envelope {
             timestamp: Utc::now(),
             tags: Vec::new(),
         }
+    }
+
+    /// Produce deterministic bytes covering **all** envelope fields except the
+    /// signature itself.  Used as the message fed to Ed25519 sign / verify so
+    /// that metadata (id, sender_pubkey, recipient, swarm_id, timestamp, tags)
+    /// is covered by the signature, not just the payload.
+    ///
+    /// The canonical form is simply the bincode serialization of the envelope
+    /// with `signature` set to an empty vec (the same sentinel value used
+    /// before signing).  Because bincode serialization is deterministic for
+    /// identical input (confirmed by the `bincode_deterministic` unit test),
+    /// this is safe to use as a signing message.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.signature = Vec::new();
+        bincode::serialize(&canonical).expect("bincode serialization of Envelope is infallible")
     }
 }
 
@@ -110,6 +126,23 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn signable_bytes_excludes_signature() {
+        let mut env = Envelope::new([0xAA; 32], "s".into(), vec![1, 2, 3]);
+        let bytes_before = env.signable_bytes();
+        env.signature = vec![0xDE; 64];
+        let bytes_after = env.signable_bytes();
+        assert_eq!(bytes_before, bytes_after, "signable_bytes must not depend on signature field");
+    }
+
+    #[test]
+    fn signable_bytes_differs_on_metadata_change() {
+        let env = Envelope::new([0xAA; 32], "swarm-a".into(), vec![1]);
+        let mut env2 = env.clone();
+        env2.swarm_id = "swarm-b".into();
+        assert_ne!(env.signable_bytes(), env2.signable_bytes());
     }
 
     #[test]

@@ -1095,7 +1095,7 @@ fn process_inbound_envelope(
         .map_err(|e| anyhow::anyhow!("invalid sender pubkey: {e}"))?;
     let sig = Signature::from_slice(&envelope.signature)
         .map_err(|e| anyhow::anyhow!("invalid signature bytes: {e}"))?;
-    signing::verify(&sender_pubkey, &envelope.payload, &sig)?;
+    signing::verify(&sender_pubkey, &envelope.signable_bytes(), &sig)?;
 
     // 3. Decrypt payload and tags if this is a private message.
     let is_private = envelope.recipient.is_some();
