@@ -193,9 +193,37 @@ fn whoami_is_not_a_command() {
 }
 
 #[test]
-fn inbox_is_not_a_command() {
-    let result = Args::try_parse_from(&["slashmail", "inbox"]);
-    assert!(result.is_err(), "inbox should no longer be a valid subcommand");
+fn parse_inbox_no_tag() {
+    let args = parse(&["slashmail", "inbox"]);
+    match args.command {
+        Command::Inbox { tag } => assert!(tag.is_none()),
+        _ => panic!("expected Inbox"),
+    }
+}
+
+#[test]
+fn parse_inbox_with_tag() {
+    let args = parse(&["slashmail", "inbox", "--tag", "urgent"]);
+    match args.command {
+        Command::Inbox { tag } => assert_eq!(tag.as_deref(), Some("urgent")),
+        _ => panic!("expected Inbox"),
+    }
+}
+
+#[test]
+fn parse_inbox_with_json_flag() {
+    let args = parse(&["slashmail", "--json", "inbox"]);
+    assert!(args.json);
+    assert!(matches!(args.command, Command::Inbox { .. }));
+}
+
+#[test]
+fn parse_inbox_with_short_tag() {
+    let args = parse(&["slashmail", "inbox", "-t", "important"]);
+    match args.command {
+        Command::Inbox { tag } => assert_eq!(tag.as_deref(), Some("important")),
+        _ => panic!("expected Inbox"),
+    }
 }
 
 // -- --json flag parsing ---------------------------------------------------

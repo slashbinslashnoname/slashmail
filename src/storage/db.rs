@@ -419,6 +419,38 @@ impl ReadOnlyMessageStore {
         }
         Ok(messages)
     }
+
+    /// List inbox messages (folder_path = 'INBOX'), newest first.
+    pub fn inbox_messages(&self, limit: u32) -> Result<Vec<Message>, AppError> {
+        let limit_val: i64 = if limit > 0 { limit as i64 } else { -1 };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read
+             FROM messages WHERE folder_path = 'INBOX' ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit_val], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
+    /// List inbox messages filtered by tag, newest first.
+    pub fn inbox_messages_by_tag(&self, tag: &str) -> Result<Vec<Message>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.tags, m.created_at, m.read
+             FROM messages m
+             JOIN message_tags mt ON m.id = mt.envelope_id
+             WHERE m.folder_path = 'INBOX' AND mt.tag = ?1
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![tag], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
 }
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -1293,5 +1325,85 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "update must fail on read-only store");
+    }
+
+    #[test]
+    fn inbox_messages_returns_only_inbox_folder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("inbox_test.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let m1 = make_message("alice", "bob", "Hello", "inbox msg");
+        // m1 has folder_path = "INBOX" by default
+
+        let mut m2 = make_message("bob", "alice", "Reply", "sent msg");
+        m2.folder_path = "SENT".to_string();
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+        store.flush_wal().unwrap();
+        drop(store);
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let inbox = ro.inbox_messages(50).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].sender, "alice");
+    }
+
+    #[test]
+    fn inbox_messages_respects_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("inbox_limit.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        for i in 0..5 {
+            let m = make_message("alice", "bob", &format!("Msg {i}"), "body");
+            store.insert_message(&m).unwrap();
+        }
+        store.flush_wal().unwrap();
+        drop(store);
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let inbox = ro.inbox_messages(3).unwrap();
+        assert_eq!(inbox.len(), 3);
+    }
+
+    #[test]
+    fn inbox_messages_by_tag_filters_correctly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("inbox_tag.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let m1 = make_message("alice", "bob", "Urgent", "urgent msg");
+        let m2 = make_message("carol", "bob", "Normal", "normal msg");
+        let mut m3 = make_message("dave", "bob", "Sent", "sent msg");
+        m3.folder_path = "SENT".to_string();
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+        store.insert_message(&m3).unwrap();
+
+        store.tag_message(&m1.id, "urgent").unwrap();
+        store.tag_message(&m2.id, "normal").unwrap();
+        store.tag_message(&m3.id, "urgent").unwrap(); // SENT folder, tagged urgent
+
+        store.flush_wal().unwrap();
+        drop(store);
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+
+        // Should only return INBOX messages with "urgent" tag (m1), not SENT (m3)
+        let results = ro.inbox_messages_by_tag("urgent").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sender, "alice");
+
+        // "normal" tag, only in INBOX
+        let results = ro.inbox_messages_by_tag("normal").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sender, "carol");
+
+        // Unknown tag
+        let results = ro.inbox_messages_by_tag("nonexistent").unwrap();
+        assert!(results.is_empty());
     }
 }
