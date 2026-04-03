@@ -490,7 +490,7 @@ fn process_inbound_envelope(
             let tag_bytes = b64
                 .decode(enc_tag)
                 .map_err(|e| anyhow::anyhow!("invalid base64 tag: {e}"))?;
-            let plain = encryption::open(&shared, &tag_bytes)?;
+            let plain = encryption::open(shared.as_bytes(), &tag_bytes)?;
             let tag_str = String::from_utf8(plain)
                 .map_err(|e| anyhow::anyhow!("tag is not valid UTF-8: {e}"))?;
             tags.push(tag_str);
@@ -510,6 +510,10 @@ fn process_inbound_envelope(
         .map(|p| p.to_string())
         .unwrap_or_default();
 
+    // 4a. Build the space-separated tags string so that FTS5 receives
+    //     plaintext tags on the initial INSERT (never encrypted bytes).
+    let tags_text = decrypted_tags.join(" ");
+
     let msg = Message {
         id: envelope.id,
         swarm_id: envelope.swarm_id,
@@ -519,7 +523,7 @@ fn process_inbound_envelope(
         recipient,
         subject: String::new(),
         body,
-        tags: String::new(), // populated by upsert_tags below
+        tags: tags_text,
         created_at: envelope.timestamp,
         read: false,
     };
@@ -767,8 +771,8 @@ mod tests {
 
         // Encrypt tags with the shared secret.
         let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
-        let enc_tag1 = encryption::seal(&shared, b"private").unwrap();
-        let enc_tag2 = encryption::seal(&shared, b"confidential").unwrap();
+        let enc_tag1 = encryption::seal(shared.as_bytes(), b"private").unwrap();
+        let enc_tag2 = encryption::seal(shared.as_bytes(), b"confidential").unwrap();
 
         let mut env = Envelope::new(
             sender_kp.verifying_key().to_bytes(),
@@ -940,6 +944,80 @@ mod tests {
         let kp = generate_keypair();
         let store = MessageStore::open_memory().unwrap();
         assert!(process_inbound_envelope(&[], &kp, &store).is_err());
+    }
+
+    #[test]
+    fn process_private_decrypted_tags_searchable_via_fts() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // Encrypt payload for recipient.
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_kp.verifying_key(), b"secret body").unwrap();
+
+        // Encrypt tags with the shared secret.
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
+        let enc_tag = encryption::seal(shared.as_bytes(), b"classified").unwrap();
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm_fts".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        env.tags = vec![b64.encode(&enc_tag)];
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap();
+
+        // Decrypted tag must be searchable via FTS5.
+        let results = store.search_messages("tags:classified").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].body, "secret body");
+
+        // The denormalized tags column must contain plaintext, not ciphertext.
+        let msgs = store.list_messages(0).unwrap();
+        assert_eq!(msgs[0].tags, "classified");
+        assert!(!msgs[0].tags.contains(&b64.encode(&enc_tag)),
+            "encrypted tag bytes must not appear in stored tags");
+    }
+
+    #[test]
+    fn process_private_tags_in_denormalized_column() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_kp.verifying_key(), b"body").unwrap();
+
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
+        let enc_tag1 = encryption::seal(shared.as_bytes(), b"alpha").unwrap();
+        let enc_tag2 = encryption::seal(shared.as_bytes(), b"beta").unwrap();
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        env.tags = vec![b64.encode(&enc_tag1), b64.encode(&enc_tag2)];
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap();
+
+        // The denormalized tags column should contain plaintext tags.
+        let msgs = store.list_messages(0).unwrap();
+        let tags_words: Vec<&str> = msgs[0].tags.split_whitespace().collect();
+        assert!(tags_words.contains(&"alpha"));
+        assert!(tags_words.contains(&"beta"));
+        // Must not contain any base64-encoded ciphertext.
+        assert!(!msgs[0].tags.contains(&b64.encode(&enc_tag1)));
     }
 
     #[test]
