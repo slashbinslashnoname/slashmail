@@ -30,8 +30,11 @@ pub struct SlashmailBehaviour {
 pub struct BehaviourError(String);
 
 impl SlashmailBehaviour {
-    /// Build a new composite behaviour from a libp2p identity keypair.
-    pub fn new(key: &Keypair) -> Result<Self, BehaviourError> {
+    /// Build a new composite behaviour from a libp2p identity keypair and an already-constructed
+    /// relay client behaviour. The relay client must be obtained from [`relay::client::new`] with
+    /// its paired transport registered in the swarm's transport stack (use
+    /// [`SwarmBuilder::with_relay_client`] to ensure this).
+    pub fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Result<Self, BehaviourError> {
         let peer_id = PeerId::from(key.public());
 
         // Gossipsub with message signing and deduplication.
@@ -64,21 +67,11 @@ impl SlashmailBehaviour {
         // Request-response for direct private mail delivery.
         let mail_rr = rr::mail_behaviour();
 
-        // Relay client for circuit relay v2 (needed by dcutr for hole punching).
-        let (relay_transport, relay_client) =
-            relay::client::new(peer_id);
-
         // DCUtR (Direct Connection Upgrade through Relay) for NAT hole punching.
         let dcutr = dcutr::Behaviour::new(peer_id);
 
         // AutoNAT for automatic NAT status detection.
         let autonat = autonat::Behaviour::new(peer_id, Default::default());
-
-        // Note: `relay_transport` must be plumbed into the transport stack by the
-        // caller when constructing the swarm. We intentionally drop it here during
-        // behaviour construction; the swarm builder in `net::build_swarm` will
-        // obtain its own relay transport instance.
-        drop(relay_transport);
 
         Ok(Self {
             gossipsub,
@@ -97,17 +90,29 @@ impl SlashmailBehaviour {
 mod tests {
     use super::*;
 
+    fn make_behaviour(key: &Keypair) -> SlashmailBehaviour {
+        let peer_id = PeerId::from(key.public());
+        // relay::client::new returns a (transport, behaviour) pair. In tests we
+        // drop the transport immediately; this is safe because unit tests never
+        // poll the swarm and therefore never trigger the relay behaviour's internal
+        // channel. Production code uses SwarmBuilder::with_relay_client so the
+        // transport stays alive for the swarm's lifetime.
+        let (_relay_transport, relay_client) = relay::client::new(peer_id);
+        SlashmailBehaviour::new(key, relay_client).unwrap()
+    }
+
     #[test]
     fn behaviour_new_succeeds() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key);
-        assert!(behaviour.is_ok());
+        let peer_id = PeerId::from(key.public());
+        let (_relay_transport, relay_client) = relay::client::new(peer_id);
+        assert!(SlashmailBehaviour::new(&key, relay_client).is_ok());
     }
 
     #[test]
     fn behaviour_gossipsub_subscribe_then_unsubscribe() {
         let key = Keypair::generate_ed25519();
-        let mut behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let mut behaviour = make_behaviour(&key);
         let topic = gossipsub::IdentTopic::new("another-topic");
         assert!(behaviour.gossipsub.subscribe(&topic).is_ok());
         assert!(behaviour.gossipsub.unsubscribe(&topic).is_ok());
@@ -116,7 +121,7 @@ mod tests {
     #[test]
     fn behaviour_gossipsub_accepts_subscription() {
         let key = Keypair::generate_ed25519();
-        let mut behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let mut behaviour = make_behaviour(&key);
         let topic = gossipsub::IdentTopic::new("test-topic");
         let result = behaviour.gossipsub.subscribe(&topic);
         assert!(result.is_ok());
@@ -125,22 +130,21 @@ mod tests {
     #[test]
     fn behaviour_has_relay_client() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key).unwrap();
-        // relay_client field exists and was constructed successfully
+        let behaviour = make_behaviour(&key);
         let _ = &behaviour.relay_client;
     }
 
     #[test]
     fn behaviour_has_dcutr() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let behaviour = make_behaviour(&key);
         let _ = &behaviour.dcutr;
     }
 
     #[test]
     fn behaviour_has_autonat() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let behaviour = make_behaviour(&key);
         let _ = &behaviour.autonat;
     }
 }
