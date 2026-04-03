@@ -166,12 +166,13 @@ wait_for_daemon "Daemon A" slashmail_a
 wait_for_daemon "Daemon B" slashmail_b
 
 # ── Get daemon A's listen address and peer ID ─────────────────────────────
-STATUS_A=$(slashmail_a --json status)
-PEER_ID_A=$(json_get "$STATUS_A" ".data.peer_id")
-# Extract the 127.0.0.1 TCP listen address from the array.
-LISTEN_ADDR_A=$(echo "$STATUS_A" | python3 -c "
+# Poll until listen_addrs is non-empty (swarm binds its port asynchronously).
+LISTEN_ADDR_A="NONE"
+for _ in $(seq 1 20); do
+    STATUS_A=$(slashmail_a --json status)
+    LISTEN_ADDR_A=$(echo "$STATUS_A" | python3 -c "
 import sys, json
-addrs = json.load(sys.stdin)['data']['daemon']['listen_addrs']
+addrs = json.load(sys.stdin)['data']['daemon'].get('listen_addrs') or []
 for a in addrs:
     if '127.0.0.1' in a and '/tcp/' in a:
         print(a)
@@ -179,7 +180,11 @@ for a in addrs:
 else:
     print('NONE')
 ")
-[ "$LISTEN_ADDR_A" != "NONE" ] || fail "daemon A has no 127.0.0.1 TCP listen address"
+    [ "$LISTEN_ADDR_A" != "NONE" ] && break
+    sleep 0.5
+done
+[ "$LISTEN_ADDR_A" != "NONE" ] || fail "daemon A has no 127.0.0.1 TCP listen address after 10s"
+PEER_ID_A=$(json_get "$STATUS_A" ".data.peer_id")
 
 info "Daemon A: peer=$PEER_ID_A addr=$LISTEN_ADDR_A"
 
@@ -218,6 +223,10 @@ LIST_COUNT=$(json_get "$LIST_OUTPUT" ".data.count")
 LIST_BODY=$(json_get "$LIST_OUTPUT" ".data.messages[0].body")
 echo "$LIST_BODY" | grep -q "$TAG" || fail "list --tag message body does not contain tag marker. body=$LIST_BODY"
 
+# Verify the sender is peer A's public key.
+LIST_SENDER=$(json_get "$LIST_OUTPUT" ".data.messages[0].sender")
+[ "$LIST_SENDER" = "$PUB_A" ] || fail "message sender mismatch: got=$LIST_SENDER expected=$PUB_A"
+
 pass "list --tag  (count=$LIST_COUNT)"
 
 # ── Verify: search on B ──────────────────────────────────────────────────
@@ -233,8 +242,14 @@ pass "search     (count=$SEARCH_COUNT)"
 
 # ── Verify: message tags are correctly decrypted on B ─────────────────────
 info "Verifying decrypted tags on B..."
-FIRST_MSG_TAGS=$(json_get "$LIST_OUTPUT" ".data.messages[0].tags")
-echo "$FIRST_MSG_TAGS" | grep -q "$TAG" || fail "tags on B do not contain '$TAG'. tags=$FIRST_MSG_TAGS"
+# tags is a JSON array; check presence via python to avoid grep matching substrings.
+FIRST_MSG_TAGS_RAW=$(json_get "$LIST_OUTPUT" ".data.messages[0].tags")
+echo "$FIRST_MSG_TAGS_RAW" | python3 -c "
+import sys, json
+tags = json.load(sys.stdin)
+if '$TAG' not in tags:
+    raise SystemExit('tags on B do not contain \\'$TAG\\'. tags=' + str(tags))
+" || fail "tags on B do not contain '$TAG'. tags=$FIRST_MSG_TAGS_RAW"
 
 pass "tag decrypt"
 
