@@ -100,6 +100,34 @@ fn parse_daemon_default_listen() {
 }
 
 #[test]
+fn parse_daemon_custom_listen() {
+    let args = parse(&["slashmail", "daemon", "--listen", "/ip4/127.0.0.1/tcp/9000"]);
+    match args.command {
+        Command::Daemon { listen } => assert_eq!(listen, "/ip4/127.0.0.1/tcp/9000"),
+        _ => panic!("expected Daemon"),
+    }
+}
+
+#[test]
+fn parse_daemon_short_listen_flag() {
+    let args = parse(&["slashmail", "daemon", "-l", "/ip4/0.0.0.0/tcp/5555"]);
+    match args.command {
+        Command::Daemon { listen } => assert_eq!(listen, "/ip4/0.0.0.0/tcp/5555"),
+        _ => panic!("expected Daemon"),
+    }
+}
+
+#[test]
+fn parse_daemon_with_json_flag() {
+    let args = parse(&["slashmail", "--json", "daemon"]);
+    assert!(args.json);
+    match args.command {
+        Command::Daemon { listen } => assert_eq!(listen, "/ip4/0.0.0.0/tcp/0"),
+        _ => panic!("expected Daemon"),
+    }
+}
+
+#[test]
 fn whoami_is_not_a_command() {
     let result = Args::try_parse_from(&["slashmail", "whoami"]);
     assert!(result.is_err(), "whoami should no longer be a valid subcommand");
