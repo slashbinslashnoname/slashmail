@@ -185,9 +185,13 @@ impl MessageStore {
     }
 
     /// Insert a message into the store.
+    ///
+    /// Uses `INSERT OR IGNORE` so that duplicate messages (same `id`) received
+    /// during concurrent sync sessions are silently skipped rather than causing
+    /// a constraint-violation error.
     pub fn insert_message(&self, msg: &Message) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read)
+            "INSERT OR IGNORE INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 msg.id.to_string(),
@@ -1477,5 +1481,20 @@ mod tests {
         // Unknown tag
         let results = ro.inbox_messages_by_tag("nonexistent").unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn insert_message_ignores_duplicate() {
+        let store = MessageStore::open_memory().unwrap();
+        let msg = make_message("alice", "bob", "Hello", "body");
+
+        // First insert succeeds.
+        store.insert_message(&msg).unwrap();
+
+        // Second insert with same ID is silently ignored (INSERT OR IGNORE).
+        store.insert_message(&msg).unwrap();
+
+        let all = store.list_messages(0).unwrap();
+        assert_eq!(all.len(), 1, "duplicate insert should not create a second row");
     }
 }

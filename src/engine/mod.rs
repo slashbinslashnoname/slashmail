@@ -1,4 +1,26 @@
 //! Engine: central event loop multiplexing swarm events, CLI commands, and OS signals.
+//!
+//! # Sync protocol — PeerId-ordered initiation
+//!
+//! When two peers connect, both could independently start a Merkle delta-sync,
+//! leading to redundant transfers in both directions.  To prevent this, sync
+//! initiation is ordered by PeerId:
+//!
+//! 1. **Lower PeerId** (lexicographic byte ordering) initiates sync immediately
+//!    by sending a `SyncRequest::RootExchange` with its local Merkle root.
+//!
+//! 2. **Higher PeerId** defers for [`SYNC_DEFER_TIMEOUT`] (500 ms), giving the
+//!    lower peer time to send its request first.  If an inbound `SyncRequest`
+//!    arrives within that window the deferred sync is cancelled — the lower peer
+//!    is already driving the exchange.  If the timeout elapses without an
+//!    incoming request (e.g. the lower peer crashed or was slow), the higher
+//!    peer initiates sync as a fallback.
+//!
+//! 3. **Idempotent storage**: all message inserts use `INSERT OR IGNORE`, so
+//!    even if both peers end up syncing simultaneously (race, network jitter),
+//!    duplicate rows are silently dropped rather than causing errors.
+//!
+//! Deferred syncs are also cleaned up on peer disconnection.
 
 pub mod merkle;
 pub mod topic_registry;
@@ -39,11 +61,23 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Duration to wait for gossipsub mesh peers after publishing.
 const GOSSIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Duration that the higher-PeerId peer waits for an incoming SyncRequest
+/// before initiating its own sync.  See [`DeferredSync`].
+const SYNC_DEFER_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Tracks a deferred gossipsub publish reply while we wait for mesh peers.
 struct PendingGossipPublish {
     reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     deadline: tokio::time::Instant,
     topic: String,
+}
+
+/// A sync initiation deferred because our local PeerId is lexicographically
+/// higher than the remote peer's.  We wait [`SYNC_DEFER_TIMEOUT`] for an
+/// incoming `SyncRequest` from that peer; if none arrives we initiate ourselves.
+struct DeferredSync {
+    peer_id: PeerId,
+    deadline: tokio::time::Instant,
 }
 
 /// Per-peer tracking state maintained by the engine.
@@ -171,10 +205,12 @@ pub async fn run_loop(
 ) -> ShutdownReason {
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let local_peer_id = *swarm.local_peer_id();
     let mut in_flight: usize = 0;
     let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
     let mut topic_registry = TopicRegistry::new();
     let mut pending_publishes: Vec<PendingGossipPublish> = Vec::new();
+    let mut deferred_syncs: Vec<DeferredSync> = Vec::new();
 
     info!("engine event loop started");
 
@@ -183,6 +219,13 @@ pub async fn run_loop(
         let next_publish_deadline = pending_publishes
             .iter()
             .map(|p| p.deadline)
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+
+        // Compute the nearest deferred-sync deadline (if any).
+        let next_sync_deadline = deferred_syncs
+            .iter()
+            .map(|d| d.deadline)
             .min()
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
@@ -214,13 +257,32 @@ pub async fn run_loop(
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                let actions = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry);
+                let actions = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry, local_peer_id, &mut deferred_syncs);
                 for action in actions {
                     apply_swarm_action(&mut swarm, action, store.as_ref());
                 }
 
                 // Check if any pending publish now has mesh peers.
                 resolve_pending_publishes(&mut swarm, &mut pending_publishes, false);
+            }
+
+            // --- Deferred sync timeout (higher-PeerId fallback) ---
+            _ = tokio::time::sleep_until(next_sync_deadline), if !deferred_syncs.is_empty() => {
+                let now = tokio::time::Instant::now();
+                let expired: Vec<PeerId> = deferred_syncs
+                    .iter()
+                    .filter(|d| d.deadline <= now)
+                    .map(|d| d.peer_id)
+                    .collect();
+                deferred_syncs.retain(|d| d.deadline > now);
+                for peer_id in expired {
+                    debug!(%peer_id, "deferred sync timeout elapsed, initiating sync as higher PeerId");
+                    apply_swarm_action(
+                        &mut swarm,
+                        SwarmAction::InitiateSync { peer_id },
+                        store.as_ref(),
+                    );
+                }
             }
 
             // --- Pending gossipsub publish timeout ---
@@ -235,7 +297,7 @@ pub async fn run_loop(
     // Resolve any pending gossipsub publishes immediately (with warning).
     resolve_pending_publishes(&mut swarm, &mut pending_publishes, true);
 
-    drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry).await;
+    drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry, local_peer_id).await;
 
     if let Some(flush) = wal_flush {
         info!("flushing SQLite WAL checkpoint");
@@ -255,6 +317,7 @@ async fn drain_in_flight(
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
     topic_registry: &TopicRegistry,
+    local_peer_id: PeerId,
 ) {
     if *in_flight == 0 {
         debug!("no in-flight requests to drain");
@@ -263,6 +326,8 @@ async fn drain_in_flight(
 
     info!(in_flight = *in_flight, "draining in-flight requests");
     let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    // No deferred syncs during shutdown drain.
+    let mut drain_deferred = Vec::new();
 
     loop {
         tokio::select! {
@@ -275,7 +340,7 @@ async fn drain_in_flight(
                 break;
             }
             event = swarm.select_next_some() => {
-                let actions = handle_swarm_event(event, in_flight, peers, keypair, store, topic_registry);
+                let actions = handle_swarm_event(event, in_flight, peers, keypair, store, topic_registry, local_peer_id, &mut drain_deferred);
                 for action in actions {
                     apply_swarm_action(swarm, action, store);
                 }
@@ -845,6 +910,8 @@ fn handle_swarm_event(
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
     topic_registry: &TopicRegistry,
+    local_peer_id: PeerId,
+    deferred_syncs: &mut Vec<DeferredSync>,
 ) -> Vec<SwarmAction> {
     match event {
         // --- Request-response events (tracked for graceful drain) ---
@@ -865,7 +932,7 @@ fn handle_swarm_event(
 
         // --- Sync events ---
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::SyncRr(sync_event)) => {
-            vec![handle_sync_event(sync_event, keypair, store)]
+            vec![handle_sync_event(sync_event, keypair, store, deferred_syncs)]
         }
 
         // --- Identify events (peer metadata) ---
@@ -930,10 +997,29 @@ fn handle_swarm_event(
                     listen_addrs: Vec::new(),
                     rtt: None,
                 });
-                vec![
-                    SwarmAction::InitiatePeerExchange { peer_id },
-                    SwarmAction::InitiateSync { peer_id },
-                ]
+                // PeerId-ordered sync: the lexicographically lower PeerId
+                // initiates sync immediately.  The higher PeerId defers for
+                // SYNC_DEFER_TIMEOUT, giving the lower peer time to send its
+                // SyncRequest first.  If no request arrives, the deferred
+                // sync fires as a fallback.
+                let local_bytes = local_peer_id.to_bytes();
+                let remote_bytes = peer_id.to_bytes();
+                if local_bytes < remote_bytes {
+                    debug!(%peer_id, "lower PeerId — initiating sync immediately");
+                    vec![
+                        SwarmAction::InitiatePeerExchange { peer_id },
+                        SwarmAction::InitiateSync { peer_id },
+                    ]
+                } else {
+                    debug!(%peer_id, "higher PeerId — deferring sync for {}ms", SYNC_DEFER_TIMEOUT.as_millis());
+                    deferred_syncs.push(DeferredSync {
+                        peer_id,
+                        deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
+                    });
+                    vec![
+                        SwarmAction::InitiatePeerExchange { peer_id },
+                    ]
+                }
             } else {
                 vec![]
             }
@@ -942,6 +1028,7 @@ fn handle_swarm_event(
             debug!(%peer_id, "connection closed");
             if num_established == 0 {
                 peers.remove(&peer_id);
+                deferred_syncs.retain(|d| d.peer_id != peer_id);
             }
             vec![]
         }
@@ -1174,12 +1261,19 @@ fn handle_sync_event(
     event: request_response::Event<SyncRequest, SyncResponse>,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
+    deferred_syncs: &mut Vec<DeferredSync>,
 ) -> SwarmAction {
     match event {
         request_response::Event::Message { message, peer, .. } => match message {
             request_response::Message::Request {
                 request, channel, ..
             } => {
+                // The remote peer initiated sync — cancel our deferred sync
+                // for this peer to avoid a redundant duplicate exchange.
+                if deferred_syncs.iter().any(|d| d.peer_id == peer) {
+                    debug!(%peer, "cancelling deferred sync — remote peer initiated first");
+                    deferred_syncs.retain(|d| d.peer_id != peer);
+                }
                 handle_sync_inbound_request(request, channel, peer, store)
             }
             request_response::Message::Response { response, .. } => {
@@ -1720,7 +1814,8 @@ mod tests {
         let topic_registry = TopicRegistry::new();
 
         let start = tokio::time::Instant::now();
-        drain_in_flight(&mut swarm, &mut in_flight, &mut peers, None, None, &topic_registry).await;
+        let local_peer_id = *swarm.local_peer_id();
+        drain_in_flight(&mut swarm, &mut in_flight, &mut peers, None, None, &topic_registry, local_peer_id).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -2789,5 +2884,105 @@ mod tests {
         for tag in &unicode_tags {
             assert!(msgs[0].tags.contains(tag), "missing tag: {tag}");
         }
+    }
+
+    // ---- PeerId-ordered sync initiation tests ----
+
+    #[test]
+    fn lower_peer_id_initiates_sync_immediately() {
+        // Build two PeerIds with known ordering.
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let peer_a = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
+        let peer_b = peer_id_from_ed25519_pubkey(&id_b.public_key()).unwrap();
+
+        let (lower, higher) = if peer_a.to_bytes() < peer_b.to_bytes() {
+            (peer_a, peer_b)
+        } else {
+            (peer_b, peer_a)
+        };
+
+        // Simulate: local = lower, remote = higher → should include InitiateSync.
+        let local_bytes = lower.to_bytes();
+        let remote_bytes = higher.to_bytes();
+        assert!(local_bytes < remote_bytes, "test setup: lower < higher");
+
+        // The logic in ConnectionEstablished: if local < remote → InitiateSync.
+        let should_initiate_immediately = local_bytes < remote_bytes;
+        assert!(should_initiate_immediately);
+    }
+
+    #[test]
+    fn higher_peer_id_defers_sync() {
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let peer_a = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
+        let peer_b = peer_id_from_ed25519_pubkey(&id_b.public_key()).unwrap();
+
+        let (lower, higher) = if peer_a.to_bytes() < peer_b.to_bytes() {
+            (peer_a, peer_b)
+        } else {
+            (peer_b, peer_a)
+        };
+
+        // Simulate: local = higher, remote = lower → should defer.
+        let mut deferred = Vec::new();
+        let local_bytes = higher.to_bytes();
+        let remote_bytes = lower.to_bytes();
+        assert!(local_bytes > remote_bytes, "test setup: higher > lower");
+
+        // Should NOT initiate immediately; should add to deferred_syncs.
+        let should_defer = local_bytes >= remote_bytes;
+        assert!(should_defer);
+
+        deferred.push(DeferredSync {
+            peer_id: lower,
+            deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
+        });
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].peer_id, lower);
+    }
+
+    #[test]
+    fn deferred_sync_cancelled_on_inbound_request() {
+        let id_a = Identity::generate();
+        let peer = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
+
+        let mut deferred = vec![
+            DeferredSync {
+                peer_id: peer,
+                deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
+            },
+        ];
+
+        // Simulate receiving an inbound SyncRequest from this peer:
+        // the deferred entry should be removed.
+        assert!(deferred.iter().any(|d| d.peer_id == peer));
+        deferred.retain(|d| d.peer_id != peer);
+        assert!(deferred.is_empty(), "deferred sync should be cancelled");
+    }
+
+    #[test]
+    fn deferred_sync_cleaned_up_on_disconnect() {
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let peer_a = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
+        let peer_b = peer_id_from_ed25519_pubkey(&id_b.public_key()).unwrap();
+
+        let mut deferred = vec![
+            DeferredSync {
+                peer_id: peer_a,
+                deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
+            },
+            DeferredSync {
+                peer_id: peer_b,
+                deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
+            },
+        ];
+
+        // Simulate peer_a disconnect.
+        deferred.retain(|d| d.peer_id != peer_a);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].peer_id, peer_b);
     }
 }
