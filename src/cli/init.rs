@@ -84,7 +84,7 @@ pub async fn status(ctx: &OutputContext) -> Result<()> {
                 public_key: Some(pk.clone()),
                 peer_id: Some(peer_id.to_string()),
                 listen_addr: config.listen_addr.clone(),
-                daemon: daemon,
+                daemon,
             };
 
             ctx.print_success(&result, || {
