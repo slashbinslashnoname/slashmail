@@ -71,6 +71,15 @@ fn parse_search() {
 }
 
 #[test]
+fn parse_add_peer() {
+    let args = parse(&["slashmail", "add-peer", "/ip4/1.2.3.4/tcp/4001"]);
+    match args.command {
+        Command::AddPeer { addr } => assert_eq!(addr, "/ip4/1.2.3.4/tcp/4001"),
+        _ => panic!("expected AddPeer"),
+    }
+}
+
+#[test]
 fn parse_peers() {
     let args = parse(&["slashmail", "peers"]);
     assert!(matches!(args.command, Command::Peers));

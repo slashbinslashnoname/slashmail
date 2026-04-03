@@ -4,7 +4,7 @@
 
 use libp2p::identity::Keypair;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response,
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
     swarm::NetworkBehaviour, PeerId,
 };
 use std::time::Duration;
@@ -22,6 +22,7 @@ pub struct SlashmailBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
     pub peer_exchange: request_response::Behaviour<PeerExchangeCodec>,
+    pub ping: ping::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
@@ -73,6 +74,9 @@ impl SlashmailBehaviour {
         // Request-response for peer routing table exchange on connect.
         let peer_exchange = peer_exchange::peer_exchange_behaviour();
 
+        // Ping for latency measurement.
+        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
+
         // DCUtR (Direct Connection Upgrade through Relay) for NAT hole punching.
         let dcutr = dcutr::Behaviour::new(peer_id);
 
@@ -86,6 +90,7 @@ impl SlashmailBehaviour {
             mdns,
             mail_rr,
             peer_exchange,
+            ping,
             relay_client,
             dcutr,
             autonat,

@@ -1,6 +1,7 @@
 mod cli;
 mod compress;
 mod crypto;
+mod ctl;
 mod db;
 mod engine;
 mod error;
