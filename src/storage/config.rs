@@ -97,7 +97,13 @@ impl Config {
     /// Return the slashmail data directory (`~/.slashmail/`).
     pub fn data_dir() -> Result<PathBuf, AppError> {
         let home = dirs_home().ok_or_else(|| {
-            AppError::Other("could not determine home directory".to_string())
+            AppError::Io {
+                path: "~".into(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "could not determine home directory; set HOME env var",
+                ),
+            }
         })?;
         Ok(home.join(".slashmail"))
     }

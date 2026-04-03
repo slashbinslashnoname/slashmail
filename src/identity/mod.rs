@@ -30,8 +30,12 @@ impl Identity {
     /// Store the private key in the OS keyring.
     pub fn store_in_keyring(&self) -> Result<(), AppError> {
         let secret_bytes = self.keypair.to_bytes();
-        keystore::set_secret(KEYRING_ACCOUNT, &secret_bytes)
-            .map_err(|e| AppError::Other(format!("failed to store key in keyring: {e}")))
+        keystore::set_secret(KEYRING_ACCOUNT, &secret_bytes).map_err(|e| {
+            match e.downcast::<keyring::Error>() {
+                Ok(ke) => AppError::Keyring(ke),
+                Err(e) => AppError::Crypto(format!("failed to store key in keyring: {e}")),
+            }
+        })
     }
 
     /// Load an identity from the OS keyring, falling back to the `SLASHMAIL_KEY`
@@ -47,7 +51,7 @@ impl Identity {
                 }
                 match keyring_err.downcast::<keyring::Error>() {
                     Ok(ke) => Err(AppError::Keyring(ke)),
-                    Err(e) => Err(AppError::Other(format!(
+                    Err(e) => Err(AppError::Crypto(format!(
                         "failed to load key from keyring: {e}"
                     ))),
                 }
@@ -79,8 +83,12 @@ impl Identity {
 
     /// Delete the private key from the OS keyring.
     pub fn delete_from_keyring() -> Result<(), AppError> {
-        keystore::delete_secret(KEYRING_ACCOUNT)
-            .map_err(|e| AppError::Other(format!("failed to delete key from keyring: {e}")))
+        keystore::delete_secret(KEYRING_ACCOUNT).map_err(|e| {
+            match e.downcast::<keyring::Error>() {
+                Ok(ke) => AppError::Keyring(ke),
+                Err(e) => AppError::Crypto(format!("failed to delete key from keyring: {e}")),
+            }
+        })
     }
 
     /// Return a reference to the signing keypair.

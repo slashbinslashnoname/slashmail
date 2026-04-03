@@ -581,7 +581,7 @@ fn acquire_daemon_lock() -> Result<std::fs::File> {
             "another daemon instance is already running (lock file held)".into(),
         )
         .into()),
-        Err(e) => Err(AppError::Other(format!(
+        Err(e) => Err(AppError::Network(format!(
             "failed to acquire daemon lock: {e}"
         ))
         .into()),
@@ -650,7 +650,7 @@ async fn run_daemon_stop() -> Result<()> {
     }
 
     signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
-        .map_err(|e| AppError::Other(format!("failed to send SIGTERM to pid {pid}: {e}")))?;
+        .map_err(|e| AppError::Network(format!("failed to send SIGTERM to daemon pid {pid}: {e}")))?;
 
     // Wait briefly for the process to exit, then clean up the PID file.
     for _ in 0..50 {

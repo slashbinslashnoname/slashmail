@@ -23,22 +23,33 @@ use error::AppError;
 async fn main() {
     let args = cli::Args::parse();
 
-    // When emitting structured JSON on stdout, redirect logs to stderr so that
-    // stdout contains only machine-readable output.
-    if args.json {
+    let is_daemon = matches!(
+        &args.command,
+        Some(cli::Command::Daemon {
+            action: cli::DaemonCommand::Start { .. } | cli::DaemonCommand::Restart { .. }
+        })
+    );
+
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    // Daemon mode: structured JSON logs on stderr for machine consumption.
+    // JSON CLI mode: human-formatted logs on stderr (stdout reserved for JSON output).
+    // Default: human-formatted logs on stdout.
+    if is_daemon {
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
+            .json()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else if args.json {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
             .with_writer(std::io::stderr)
             .init();
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
+            .with_env_filter(env_filter)
             .init();
     }
     let ctx = OutputContext::new(args.json);

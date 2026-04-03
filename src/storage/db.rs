@@ -69,9 +69,10 @@ impl MessageStore {
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         if !options.iter().any(|opt| opt == "ENABLE_FTS5") {
-            return Err(AppError::Other(
-                "SQLite was not compiled with FTS5 support".to_string(),
-            ));
+            return Err(AppError::Database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("SQLite was not compiled with FTS5 support; rebuild with -DSQLITE_ENABLE_FTS5 or use the bundled feature".to_string()),
+            )));
         }
         Ok(())
     }

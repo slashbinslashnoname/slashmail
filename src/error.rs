@@ -86,6 +86,27 @@ impl AppError {
                     "Verify network connectivity".into(),
                 ]
             }
+            AppError::Io { path, .. } => {
+                vec![
+                    format!("Check that {} exists and is accessible", path.display()),
+                    "Verify file permissions and disk space".into(),
+                ]
+            }
+            AppError::Database(_) => {
+                vec![
+                    "The database may be corrupted — try removing ~/.slashmail/messages.db and re-syncing".into(),
+                    "Ensure SQLite was compiled with FTS5 support".into(),
+                ]
+            }
+            AppError::Crypto(_) => {
+                vec![
+                    "Run `slashmail init` to regenerate your identity".into(),
+                    "If using SLASHMAIL_KEY, verify it is a valid base64-encoded 32-byte key".into(),
+                ]
+            }
+            AppError::ConfigSerialize(_) => {
+                vec!["Check ~/.slashmail/config.toml for syntax errors".into()]
+            }
             _ => vec![],
         }
     }
@@ -107,5 +128,41 @@ mod tests {
             suggestions.iter().any(|s| s.contains("slashmail init")),
             "keyring error should suggest slashmail init, got: {suggestions:?}"
         );
+    }
+
+    #[test]
+    fn io_error_suggests_path_check() {
+        let err = AppError::Io {
+            path: PathBuf::from("/tmp/missing"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        };
+        let s = err.suggestions();
+        assert!(!s.is_empty(), "Io error should have suggestions");
+        assert!(s.iter().any(|s| s.contains("/tmp/missing")));
+    }
+
+    #[test]
+    fn database_error_suggests_rebuild() {
+        let err = AppError::Database(rusqlite::Error::QueryReturnedNoRows);
+        let s = err.suggestions();
+        assert!(!s.is_empty(), "Database error should have suggestions");
+        assert!(s.iter().any(|s| s.contains("messages.db")));
+    }
+
+    #[test]
+    fn crypto_error_suggests_init() {
+        let err = AppError::Crypto("bad key".into());
+        let s = err.suggestions();
+        assert!(!s.is_empty(), "Crypto error should have suggestions");
+        assert!(s.iter().any(|s| s.contains("slashmail init")));
+        assert!(s.iter().any(|s| s.contains("SLASHMAIL_KEY")));
+    }
+
+    #[test]
+    fn config_serialize_error_suggests_check() {
+        let err = AppError::ConfigSerialize(toml::to_string(&()).unwrap_err());
+        let s = err.suggestions();
+        assert!(!s.is_empty(), "ConfigSerialize should have suggestions");
+        assert!(s.iter().any(|s| s.contains("config.toml")));
     }
 }
