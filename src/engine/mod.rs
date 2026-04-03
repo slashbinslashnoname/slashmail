@@ -351,17 +351,13 @@ fn collect_peer_table(swarm: &mut Swarm<SlashmailBehaviour>) -> Vec<PeerInfo> {
         }
     }
 
-    // Include our own external addresses so the remote peer can share them.
-    let own_addrs: Vec<libp2p::Multiaddr> =
-        swarm.external_addresses().cloned().collect();
+    // Include our own external and listen addresses merged under one entry,
+    // so the receiver gets a single canonical record for our peer ID.
+    let mut own_addrs: Vec<libp2p::Multiaddr> = swarm.external_addresses().cloned().collect();
+    own_addrs.extend(swarm.listeners().cloned());
+    own_addrs.dedup();
     if !own_addrs.is_empty() {
         table.push(peer_exchange::to_peer_info(&local_peer_id, &own_addrs));
-    }
-
-    // Include our listen addresses as well.
-    let listen_addrs: Vec<libp2p::Multiaddr> = swarm.listeners().cloned().collect();
-    if !listen_addrs.is_empty() {
-        table.push(peer_exchange::to_peer_info(&local_peer_id, &listen_addrs));
     }
 
     table
@@ -443,9 +439,20 @@ fn handle_swarm_event(
             info!(%address, "new listen address");
             SwarmAction::None
         }
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            num_established,
+            ..
+        } => {
             info!(%peer_id, "connection established");
-            SwarmAction::InitiatePeerExchange { peer_id }
+            // Only initiate peer exchange on the first connection to avoid
+            // duplicate exchanges when dcutr upgrades a relay connection to
+            // a direct one (which fires a second ConnectionEstablished).
+            if num_established.get() == 1 {
+                SwarmAction::InitiatePeerExchange { peer_id }
+            } else {
+                SwarmAction::None
+            }
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             debug!(%peer_id, "connection closed");
