@@ -1,5 +1,6 @@
 //! Engine: central event loop multiplexing swarm events, CLI commands, and OS signals.
 
+pub mod merkle;
 pub mod topic_registry;
 
 use std::collections::HashMap;
@@ -21,11 +22,13 @@ use crate::crypto::ecdh;
 use crate::crypto::encryption;
 use crate::crypto::signing::{self, Keypair, PublicKey};
 use crate::message::codec as msg_codec;
+use crate::engine::merkle::MerkleTree;
 use crate::net::behaviour::{SlashmailBehaviour, SlashmailBehaviourEvent};
 use crate::net::peer_exchange::{
     self, PeerExchangeRequest, PeerExchangeResponse,
 };
 use crate::net::rr::{MailRequest, MailResponse};
+use crate::net::sync_rr::{SyncRequest, SyncResponse};
 use crate::storage::db::{Message, MessageStore};
 
 pub use topic_registry::TopicRegistry;
@@ -211,8 +214,10 @@ pub async fn run_loop(
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry);
-                apply_swarm_action(&mut swarm, action);
+                let actions = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry);
+                for action in actions {
+                    apply_swarm_action(&mut swarm, action, store.as_ref());
+                }
 
                 // Check if any pending publish now has mesh peers.
                 resolve_pending_publishes(&mut swarm, &mut pending_publishes, false);
@@ -270,8 +275,10 @@ async fn drain_in_flight(
                 break;
             }
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, in_flight, peers, keypair, store, topic_registry);
-                apply_swarm_action(swarm, action);
+                let actions = handle_swarm_event(event, in_flight, peers, keypair, store, topic_registry);
+                for action in actions {
+                    apply_swarm_action(swarm, action, store);
+                }
                 if *in_flight == 0 {
                     info!("all in-flight requests drained");
                     break;
@@ -519,6 +526,10 @@ fn handle_command(
                         warn!(%e, "failed to store sent message locally");
                     } else {
                         info!(%message_id, "message stored in Sent folder");
+                        // Store raw envelope for Merkle delta sync.
+                        if let Err(e) = st.store_raw_envelope(&envelope.id, &encoded) {
+                            warn!(%e, "failed to store raw envelope for sent message");
+                        }
                     }
                     // Upsert plaintext tags into normalised tag table.
                     if !tags.is_empty() {
@@ -595,12 +606,32 @@ enum SwarmAction {
     PeerExchangeLearn {
         peers_received: Vec<peer_exchange::PeerInfo>,
     },
+    /// Initiate Merkle sync with a peer by sending our root hash.
+    InitiateSync {
+        peer_id: libp2p::PeerId,
+    },
+    /// Respond to a sync request on the given channel.
+    SyncRespond {
+        channel: request_response::ResponseChannel<SyncResponse>,
+        response: SyncResponse,
+    },
+    /// Continue sync: request bucket IDs for differing buckets.
+    SyncRequestBucketIds {
+        peer_id: libp2p::PeerId,
+        bucket_indices: Vec<u16>,
+    },
+    /// Continue sync: fetch missing messages from peer.
+    SyncFetchMessages {
+        peer_id: libp2p::PeerId,
+        ids: Vec<String>,
+    },
 }
 
 /// Apply a [`SwarmAction`] to the swarm.
 fn apply_swarm_action(
     swarm: &mut Swarm<SlashmailBehaviour>,
     action: SwarmAction,
+    store: Option<&MessageStore>,
 ) {
     match action {
         SwarmAction::None => {}
@@ -641,6 +672,53 @@ fn apply_swarm_action(
         }
         SwarmAction::PeerExchangeLearn { peers_received } => {
             dial_learned_peers(swarm, &peers_received);
+        }
+        SwarmAction::InitiateSync { peer_id } => {
+            if let Some(st) = store {
+                match st.all_message_ids() {
+                    Ok(ids) => {
+                        let tree = MerkleTree::from_ids(&ids);
+                        let root = *tree.root();
+                        swarm
+                            .behaviour_mut()
+                            .sync_rr
+                            .send_request(&peer_id, SyncRequest::RootExchange { root });
+                        info!(%peer_id, "sent sync root exchange request");
+                    }
+                    Err(e) => {
+                        warn!(%peer_id, %e, "failed to compute Merkle root for sync");
+                    }
+                }
+            } else {
+                debug!(%peer_id, "no store configured, skipping sync");
+            }
+        }
+        SwarmAction::SyncRespond { channel, response } => {
+            if swarm
+                .behaviour_mut()
+                .sync_rr
+                .send_response(channel, response)
+                .is_err()
+            {
+                warn!("failed to send sync response");
+            }
+        }
+        SwarmAction::SyncRequestBucketIds {
+            peer_id,
+            bucket_indices,
+        } => {
+            swarm
+                .behaviour_mut()
+                .sync_rr
+                .send_request(&peer_id, SyncRequest::GetBucketIds { bucket_indices });
+            debug!(%peer_id, "sent sync GetBucketIds request");
+        }
+        SwarmAction::SyncFetchMessages { peer_id, ids } => {
+            swarm
+                .behaviour_mut()
+                .sync_rr
+                .send_request(&peer_id, SyncRequest::FetchMessages { ids });
+            debug!(%peer_id, "sent sync FetchMessages request");
         }
     }
 }
@@ -767,22 +845,27 @@ fn handle_swarm_event(
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
     topic_registry: &TopicRegistry,
-) -> SwarmAction {
+) -> Vec<SwarmAction> {
     match event {
         // --- Request-response events (tracked for graceful drain) ---
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::MailRr(rr_event)) => {
-            handle_rr_event(rr_event, in_flight, keypair, store)
+            vec![handle_rr_event(rr_event, in_flight, keypair, store)]
         }
 
         // --- Gossipsub events ---
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::Gossipsub(gs_event)) => {
             handle_gossipsub_event(gs_event, keypair, store, topic_registry);
-            SwarmAction::None
+            vec![]
         }
 
         // --- Peer exchange events ---
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::PeerExchange(px_event)) => {
-            handle_peer_exchange_event(px_event)
+            vec![handle_peer_exchange_event(px_event)]
+        }
+
+        // --- Sync events ---
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::SyncRr(sync_event)) => {
+            vec![handle_sync_event(sync_event, keypair, store)]
         }
 
         // --- Identify events (peer metadata) ---
@@ -796,7 +879,7 @@ fn handle_swarm_event(
                 state.protocols = info.protocols.iter().map(|p| p.to_string()).collect();
                 state.listen_addrs = info.listen_addrs;
             }
-            SwarmAction::None
+            vec![]
         }
 
         // --- Ping events (latency measurement) ---
@@ -809,7 +892,7 @@ fn handle_swarm_event(
             if let Some(state) = peers.get_mut(&peer) {
                 state.rtt = Some(rtt);
             }
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::Ping(ping::Event {
             peer,
@@ -817,19 +900,19 @@ fn handle_swarm_event(
             ..
         })) => {
             debug!(%peer, %e, "ping failure");
-            SwarmAction::None
+            vec![]
         }
 
         // --- Other behaviour events ---
         SwarmEvent::Behaviour(event) => {
             debug!(?event, "behaviour event");
-            SwarmAction::None
+            vec![]
         }
 
         // --- Connection / listener lifecycle ---
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "new listen address");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -837,9 +920,9 @@ fn handle_swarm_event(
             ..
         } => {
             info!(%peer_id, "connection established");
-            // Only initiate peer exchange on the first connection to avoid
-            // duplicate exchanges when dcutr upgrades a relay connection to
-            // a direct one (which fires a second ConnectionEstablished).
+            // Only initiate peer exchange and sync on the first connection to
+            // avoid duplicate exchanges when dcutr upgrades a relay connection
+            // to a direct one (which fires a second ConnectionEstablished).
             if num_established.get() == 1 {
                 peers.insert(peer_id, PeerState {
                     connected_since: Utc::now(),
@@ -847,9 +930,12 @@ fn handle_swarm_event(
                     listen_addrs: Vec::new(),
                     rtt: None,
                 });
-                SwarmAction::InitiatePeerExchange { peer_id }
+                vec![
+                    SwarmAction::InitiatePeerExchange { peer_id },
+                    SwarmAction::InitiateSync { peer_id },
+                ]
             } else {
-                SwarmAction::None
+                vec![]
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -857,51 +943,51 @@ fn handle_swarm_event(
             if num_established == 0 {
                 peers.remove(&peer_id);
             }
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::IncomingConnection { local_addr, .. } => {
             debug!(%local_addr, "incoming connection");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::OutgoingConnectionError { error, .. } => {
             warn!(%error, "outgoing connection error");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming connection error");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             debug!(%address, "listen address expired");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ListenerClosed { listener_id, .. } => {
             debug!(?listener_id, "listener closed");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ListenerError { listener_id, error, .. } => {
             warn!(?listener_id, %error, "listener error");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::Dialing { peer_id, .. } => {
             debug!(?peer_id, "dialing");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::NewExternalAddrCandidate { address, .. } => {
             debug!(%address, "new external address candidate");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ExternalAddrConfirmed { address, .. } => {
             info!(%address, "external address confirmed");
-            SwarmAction::None
+            vec![]
         }
         SwarmEvent::ExternalAddrExpired { address, .. } => {
             debug!(%address, "external address expired");
-            SwarmAction::None
+            vec![]
         }
         event => {
             debug!(?event, "unhandled swarm event");
-            SwarmAction::None
+            vec![]
         }
     }
 }
@@ -1076,6 +1162,249 @@ fn handle_peer_exchange_event(
     }
 }
 
+/// Handle sync request-response events for Merkle-tree delta synchronisation.
+///
+/// **Inbound requests** are answered by computing our local Merkle tree and
+/// returning the appropriate data (root+bucket hashes, bucket IDs, or raw
+/// envelopes).
+///
+/// **Outbound responses** drive the multi-step sync protocol forward: comparing
+/// roots, requesting differing bucket IDs, and fetching missing messages.
+fn handle_sync_event(
+    event: request_response::Event<SyncRequest, SyncResponse>,
+    keypair: Option<&Keypair>,
+    store: Option<&MessageStore>,
+) -> SwarmAction {
+    match event {
+        request_response::Event::Message { message, peer, .. } => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                handle_sync_inbound_request(request, channel, peer, store)
+            }
+            request_response::Message::Response { response, .. } => {
+                handle_sync_inbound_response(response, peer, keypair, store)
+            }
+        },
+        request_response::Event::OutboundFailure {
+            peer, error, ..
+        } => {
+            debug!(%peer, %error, "sync outbound failure");
+            SwarmAction::None
+        }
+        request_response::Event::InboundFailure {
+            peer, error, ..
+        } => {
+            debug!(%peer, %error, "sync inbound failure");
+            SwarmAction::None
+        }
+        request_response::Event::ResponseSent { peer, .. } => {
+            debug!(%peer, "sync response sent");
+            SwarmAction::None
+        }
+    }
+}
+
+/// Handle an inbound sync request by computing the answer from our local store.
+fn handle_sync_inbound_request(
+    request: SyncRequest,
+    channel: request_response::ResponseChannel<SyncResponse>,
+    peer: PeerId,
+    store: Option<&MessageStore>,
+) -> SwarmAction {
+    let Some(st) = store else {
+        warn!(%peer, "sync request received but no store configured");
+        // Send an empty root result so the peer doesn't hang.
+        return SwarmAction::SyncRespond {
+            channel,
+            response: SyncResponse::RootResult {
+                root: [0u8; 32],
+                bucket_hashes: vec![[0u8; 32]; merkle::NUM_BUCKETS],
+            },
+        };
+    };
+
+    match request {
+        SyncRequest::RootExchange { root: _remote_root } => {
+            match st.all_message_ids() {
+                Ok(ids) => {
+                    let tree = MerkleTree::from_ids(&ids);
+                    info!(%peer, "sync: responding with root and bucket hashes");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::RootResult {
+                            root: *tree.root(),
+                            bucket_hashes: tree.bucket_hashes().to_vec(),
+                        },
+                    }
+                }
+                Err(e) => {
+                    warn!(%peer, %e, "sync: failed to compute Merkle tree");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::RootResult {
+                            root: [0u8; 32],
+                            bucket_hashes: vec![[0u8; 32]; merkle::NUM_BUCKETS],
+                        },
+                    }
+                }
+            }
+        }
+        SyncRequest::GetBucketIds { bucket_indices } => {
+            match st.all_message_ids() {
+                Ok(ids) => {
+                    let tree = MerkleTree::from_ids(&ids);
+                    let buckets: Vec<(u16, Vec<String>)> = bucket_indices
+                        .iter()
+                        .map(|&idx| {
+                            let bucket_ids: Vec<String> = tree
+                                .bucket_ids(idx as usize)
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect();
+                            (idx, bucket_ids)
+                        })
+                        .collect();
+                    info!(%peer, num_buckets = buckets.len(), "sync: responding with bucket IDs");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::BucketIds { buckets },
+                    }
+                }
+                Err(e) => {
+                    warn!(%peer, %e, "sync: failed to get bucket IDs");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::BucketIds { buckets: vec![] },
+                    }
+                }
+            }
+        }
+        SyncRequest::FetchMessages { ids } => {
+            match st.get_raw_envelopes(&ids) {
+                Ok(envelopes) => {
+                    info!(%peer, requested = ids.len(), found = envelopes.len(), "sync: responding with raw envelopes");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::Messages { envelopes },
+                    }
+                }
+                Err(e) => {
+                    warn!(%peer, %e, "sync: failed to get raw envelopes");
+                    SwarmAction::SyncRespond {
+                        channel,
+                        response: SyncResponse::Messages { envelopes: vec![] },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a sync response we received after sending a request.
+///
+/// This drives the multi-step protocol:
+/// 1. `RootResult` → compare bucket hashes, request differing bucket IDs
+/// 2. `BucketIds` → diff IDs, request missing messages
+/// 3. `Messages` → process and store the received envelopes
+fn handle_sync_inbound_response(
+    response: SyncResponse,
+    peer: PeerId,
+    keypair: Option<&Keypair>,
+    store: Option<&MessageStore>,
+) -> SwarmAction {
+    let Some(st) = store else {
+        return SwarmAction::None;
+    };
+
+    match response {
+        SyncResponse::RootResult {
+            root: remote_root,
+            bucket_hashes: remote_bucket_hashes,
+        } => {
+            // Compare roots — if equal, we're in sync.
+            let ids = match st.all_message_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(%peer, %e, "sync: failed to get local message IDs");
+                    return SwarmAction::None;
+                }
+            };
+            let local_tree = MerkleTree::from_ids(&ids);
+            if *local_tree.root() == remote_root {
+                info!(%peer, "sync: roots match, already in sync");
+                return SwarmAction::None;
+            }
+
+            // Roots differ — find which buckets are different.
+            let differing = local_tree.differing_buckets(&remote_bucket_hashes);
+            if differing.is_empty() {
+                info!(%peer, "sync: no differing buckets despite different roots (possible race)");
+                return SwarmAction::None;
+            }
+            info!(%peer, num_differing = differing.len(), "sync: requesting bucket IDs for differing buckets");
+            SwarmAction::SyncRequestBucketIds {
+                peer_id: peer,
+                bucket_indices: differing,
+            }
+        }
+        SyncResponse::BucketIds { buckets } => {
+            // Build our local tree and find IDs the remote has that we don't.
+            let ids = match st.all_message_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(%peer, %e, "sync: failed to get local message IDs");
+                    return SwarmAction::None;
+                }
+            };
+            let local_tree = MerkleTree::from_ids(&ids);
+
+            let remote_bucket_ids: Vec<(u16, Vec<uuid::Uuid>)> = buckets
+                .iter()
+                .filter_map(|(idx, id_strings)| {
+                    let uuids: Vec<uuid::Uuid> = id_strings
+                        .iter()
+                        .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+                        .collect();
+                    Some((*idx, uuids))
+                })
+                .collect();
+
+            let missing = local_tree.missing_ids(&remote_bucket_ids);
+            if missing.is_empty() {
+                info!(%peer, "sync: no missing messages (remote may be missing ours)");
+                return SwarmAction::None;
+            }
+            let missing_strs: Vec<String> = missing.iter().map(|id| id.to_string()).collect();
+            info!(%peer, count = missing_strs.len(), "sync: fetching missing messages");
+            SwarmAction::SyncFetchMessages {
+                peer_id: peer,
+                ids: missing_strs,
+            }
+        }
+        SyncResponse::Messages { envelopes } => {
+            // Process each received envelope and store it.
+            let mut stored = 0usize;
+            let mut skipped = 0usize;
+            for (id_str, raw_data) in &envelopes {
+                if let (Some(kp), Some(st)) = (keypair, Some(st)) {
+                    match process_inbound_envelope(raw_data, kp, st) {
+                        Ok(()) => {
+                            stored += 1;
+                        }
+                        Err(e) => {
+                            debug!(%peer, id = %id_str, %e, "sync: failed to process envelope");
+                            skipped += 1;
+                        }
+                    }
+                }
+            }
+            info!(%peer, stored, skipped, "sync: message fetch complete");
+            SwarmAction::None
+        }
+    }
+}
+
 /// Decode, verify, decrypt, and store an inbound envelope.
 ///
 /// For **private** messages (`envelope.recipient.is_some()`):
@@ -1160,7 +1489,10 @@ fn process_inbound_envelope(
 
     store.insert_message(&msg)?;
 
-    // 5. Upsert tags into the normalised tag table.
+    // 5. Store the raw envelope bytes for Merkle delta sync re-transmission.
+    store.store_raw_envelope(&envelope.id, data)?;
+
+    // 6. Upsert tags into the normalised tag table.
     if !decrypted_tags.is_empty() {
         let tag_refs: Vec<&str> = decrypted_tags.iter().map(|s| s.as_str()).collect();
         store.upsert_tags(&envelope.id, &tag_refs)?;

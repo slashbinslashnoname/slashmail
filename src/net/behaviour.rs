@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use super::peer_exchange::{self, PeerExchangeCodec};
 use super::rr::{self, MailCodec};
+use super::sync_rr::{self, SyncCodec};
 
 /// Maximum gossipsub message size (256 KiB).
 ///
@@ -29,6 +30,7 @@ pub struct SlashmailBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
     pub peer_exchange: request_response::Behaviour<PeerExchangeCodec>,
+    pub sync_rr: request_response::Behaviour<SyncCodec>,
     pub ping: ping::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
@@ -103,6 +105,9 @@ impl SlashmailBehaviour {
         // Request-response for peer routing table exchange on connect.
         let peer_exchange = peer_exchange::peer_exchange_behaviour();
 
+        // Request-response for Merkle-tree delta sync.
+        let sync_rr = sync_rr::sync_behaviour();
+
         // Ping for latency measurement.
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
 
@@ -119,6 +124,7 @@ impl SlashmailBehaviour {
             mdns,
             mail_rr,
             peer_exchange,
+            sync_rr,
             ping,
             relay_client,
             dcutr,

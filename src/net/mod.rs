@@ -3,6 +3,7 @@
 pub mod behaviour;
 pub mod peer_exchange;
 pub mod rr;
+pub mod sync_rr;
 pub mod transport;
 
 use crate::error::AppError;

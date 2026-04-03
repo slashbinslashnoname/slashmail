@@ -7,7 +7,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 /// Current schema version.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// A stored message with searchable text fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +110,9 @@ impl MessageStore {
         if current < 1 {
             self.migrate_v1()?;
         }
+        if current < 2 {
+            self.migrate_v2()?;
+        }
 
         Ok(())
     }
@@ -168,6 +171,15 @@ impl MessageStore {
             CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag);
 
             INSERT INTO db_migrations (version) VALUES (1);",
+        )?;
+        Ok(())
+    }
+
+    /// V2: add raw_envelope column for Merkle sync protocol.
+    fn migrate_v2(&self) -> Result<(), AppError> {
+        self.conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN raw_envelope BLOB;
+             INSERT INTO db_migrations (version) VALUES (2);",
         )?;
         Ok(())
     }
@@ -340,6 +352,65 @@ impl MessageStore {
             params![envelope_id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Store the raw wire-encoded envelope bytes for a message.
+    ///
+    /// Called after [`insert_message`] to preserve the original signed+encrypted
+    /// bytes for later re-transmission during Merkle delta sync.
+    pub fn store_raw_envelope(&self, id: &Uuid, data: &[u8]) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE messages SET raw_envelope = ?2 WHERE id = ?1",
+            params![id.to_string(), data],
+        )?;
+        Ok(())
+    }
+
+    /// Return all message IDs in the store.
+    pub fn all_message_ids(&self) -> Result<Vec<Uuid>, AppError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM messages")?;
+        let rows = stmt.query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            Uuid::parse_str(&id_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Retrieve raw envelope bytes for a set of message IDs.
+    ///
+    /// Returns `(id_string, raw_bytes)` pairs for messages that have raw
+    /// envelope data stored. Messages without raw data are silently skipped.
+    pub fn get_raw_envelopes(&self, ids: &[String]) -> Result<Vec<(String, Vec<u8>)>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT id, raw_envelope FROM messages WHERE id IN ({}) AND raw_envelope IS NOT NULL",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        for (i, id) in ids.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, id.as_str())?;
+        }
+        let mut result = Vec::new();
+        let mut rows = stmt.raw_query();
+        while let Some(row) = rows.next()? {
+            let id_str: String = row.get(0)?;
+            let data: Vec<u8> = row.get(1)?;
+            result.push((id_str, data));
+        }
+        Ok(result)
     }
 }
 
@@ -897,12 +968,12 @@ mod tests {
         let store = MessageStore::open_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
-        // db_migrations table has exactly one row
+        // db_migrations table has one row per applied version
         let count: i64 = store
             .conn()
             .query_row("SELECT COUNT(*) FROM db_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, SCHEMA_VERSION);
     }
 
     #[test]
@@ -916,7 +987,7 @@ mod tests {
             .conn()
             .query_row("SELECT COUNT(*) FROM db_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, SCHEMA_VERSION);
     }
 
     #[test]
@@ -1143,7 +1214,7 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), 0);
 
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
         // Verify tables exist and work
         let m = make_message("alice", "bob", "Hi", "Hello");
@@ -1168,7 +1239,7 @@ mod tests {
 
         // Re-run migration — should not error or lose data
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
         let tags = store.get_message_tags(&m.id).unwrap();
         assert_eq!(tags, vec!["important", "inbox"]);
@@ -1195,7 +1266,7 @@ mod tests {
         // Reopen — migrate runs again, data survives
         {
             let store = MessageStore::open(&db_path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
             let all = store.list_messages(0).unwrap();
             assert_eq!(all.len(), 1);
