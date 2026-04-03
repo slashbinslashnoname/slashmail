@@ -10,6 +10,7 @@ use libp2p::{
 use std::time::Duration;
 use thiserror::Error;
 
+use super::peer_exchange::{self, PeerExchangeCodec};
 use super::rr::{self, MailCodec};
 
 /// Combined libp2p behaviour for slashmail.
@@ -20,6 +21,7 @@ pub struct SlashmailBehaviour {
     pub identify: identify::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
+    pub peer_exchange: request_response::Behaviour<PeerExchangeCodec>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
@@ -68,6 +70,9 @@ impl SlashmailBehaviour {
         // Request-response for direct private mail delivery.
         let mail_rr = rr::mail_behaviour();
 
+        // Request-response for peer routing table exchange on connect.
+        let peer_exchange = peer_exchange::peer_exchange_behaviour();
+
         // DCUtR (Direct Connection Upgrade through Relay) for NAT hole punching.
         let dcutr = dcutr::Behaviour::new(peer_id);
 
@@ -80,6 +85,7 @@ impl SlashmailBehaviour {
             identify,
             mdns,
             mail_rr,
+            peer_exchange,
             relay_client,
             dcutr,
             autonat,
@@ -147,5 +153,12 @@ mod tests {
         let key = Keypair::generate_ed25519();
         let behaviour = make_behaviour(&key);
         let _ = &behaviour.autonat;
+    }
+
+    #[test]
+    fn behaviour_has_peer_exchange() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = make_behaviour(&key);
+        let _ = &behaviour.peer_exchange;
     }
 }
