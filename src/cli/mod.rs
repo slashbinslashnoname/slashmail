@@ -90,23 +90,26 @@ struct PeerRow {
     rtt: String,
 }
 
+/// Truncate a string to at most `max_chars` characters, appending `…` if truncated.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// Convert a slice of messages into table rows for display.
 fn message_rows(messages: &[crate::storage::db::Message]) -> Vec<MessageRow> {
     messages
         .iter()
         .map(|msg| {
             // Truncate sender for display
-            let sender = if msg.sender.len() > 20 {
-                format!("{}…", &msg.sender[..19])
-            } else {
-                msg.sender.clone()
-            };
+            let sender = truncate_chars(&msg.sender, 19);
             // Truncate subject
-            let subject = if msg.subject.len() > 30 {
-                format!("{}…", &msg.subject[..29])
-            } else {
-                msg.subject.clone()
-            };
+            let subject = truncate_chars(&msg.subject, 29);
             // Tags: replace spaces with ", " for readability
             let tags = if msg.tags.is_empty() {
                 "-".into()
@@ -114,12 +117,10 @@ fn message_rows(messages: &[crate::storage::db::Message]) -> Vec<MessageRow> {
                 msg.tags.split_whitespace().collect::<Vec<_>>().join(", ")
             };
             // Preview: first 40 chars of body
-            let preview = if msg.body.len() > 40 {
-                format!("{}…", &msg.body[..39])
-            } else if msg.body.is_empty() {
+            let preview = if msg.body.is_empty() {
                 "-".into()
             } else {
-                msg.body.clone()
+                truncate_chars(&msg.body, 39)
             };
             MessageRow {
                 sender,
@@ -219,11 +220,7 @@ pub async fn run(args: Args) -> Result<()> {
                             .into_iter()
                             .map(|p| {
                                 // Truncate PeerId for display (keep first 16 chars + ...)
-                                let short_id = if p.peer_id.len() > 16 {
-                                    format!("{}...", &p.peer_id[..16])
-                                } else {
-                                    p.peer_id
-                                };
+                                let short_id = truncate_chars(&p.peer_id, 16);
                                 PeerRow {
                                     peer_id: short_id,
                                     addrs: if p.addrs.is_empty() {

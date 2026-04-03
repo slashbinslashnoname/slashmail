@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use super::{message_rows, Args, Command};
+use super::{message_rows, truncate_chars, Args, Command};
 use crate::storage::db::Message;
 use chrono::Utc;
 use uuid::Uuid;
@@ -124,6 +124,30 @@ fn test_message(sender: &str, subject: &str, body: &str, tags: &str) -> Message 
         created_at: Utc::now(),
         read: false,
     }
+}
+
+#[test]
+fn truncate_chars_ascii_no_truncation() {
+    assert_eq!(truncate_chars("hello", 10), "hello");
+}
+
+#[test]
+fn truncate_chars_ascii_truncates() {
+    assert_eq!(truncate_chars("hello world", 5), "hello…");
+}
+
+#[test]
+fn truncate_chars_multibyte_does_not_panic() {
+    // Each char here is a 3-byte UTF-8 sequence; naive byte slicing would panic.
+    let s = "こんにちは世界これはテスト"; // 13 Japanese chars
+    let result = truncate_chars(s, 5);
+    assert_eq!(result, "こんにちは…");
+    assert_eq!(result.chars().count(), 6); // 5 chars + ellipsis
+}
+
+#[test]
+fn truncate_chars_exactly_at_limit() {
+    assert_eq!(truncate_chars("hello", 5), "hello");
 }
 
 #[test]
