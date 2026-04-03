@@ -62,6 +62,12 @@ pub enum Command {
         /// Multiaddress of the peer to dial (e.g. /ip4/1.2.3.4/tcp/4001)
         addr: String,
     },
+    /// Show inbox messages (received)
+    Inbox {
+        /// Filter by tag
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
     /// List known peers
     Peers,
     /// Start the P2P daemon
@@ -332,6 +338,29 @@ pub async fn run(args: Args) -> Result<()> {
             let result = MessagesResult { count: json_msgs.len(), messages: json_msgs };
             ctx.print_success(&result, || {
                 print_message_table(&results, &format!("No messages match \"{query}\"."));
+            });
+            Ok(())
+        }
+        Command::Inbox { tag } => {
+            tracing::info!(?tag, "showing inbox");
+            let db_path = Config::db_path()?;
+            if !db_path.exists() {
+                let empty: Vec<MessageJson> = vec![];
+                let result = MessagesResult { messages: empty, count: 0 };
+                ctx.print_success(&result, || {
+                    println!("No messages yet. Run `slashmail init` first.");
+                });
+                return Ok(());
+            }
+            let store = ReadOnlyMessageStore::open(&db_path)?;
+            let messages = match tag {
+                Some(ref t) => store.inbox_messages_by_tag(t)?,
+                None => store.inbox_messages(50)?,
+            };
+            let json_msgs: Vec<MessageJson> = messages.iter().map(MessageJson::from).collect();
+            let result = MessagesResult { count: json_msgs.len(), messages: json_msgs };
+            ctx.print_success(&result, || {
+                print_message_table(&messages, "Inbox is empty.");
             });
             Ok(())
         }
