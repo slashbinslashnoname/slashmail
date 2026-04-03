@@ -6,6 +6,7 @@ use libp2p::PeerId;
 use super::{DaemonStatus, InitResult, StatusResult};
 use crate::cli::output::OutputContext;
 use crate::ctl::{self, CtlRequest, CtlResponse};
+use crate::error::AppError;
 use crate::identity::Identity;
 use crate::net;
 use crate::storage::Config;
@@ -19,9 +20,9 @@ pub async fn run(ctx: &OutputContext) -> Result<()> {
         let path = Config::config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/.slashmail/config.toml".to_string());
-        anyhow::bail!(
+        Err(AppError::InvalidInput(format!(
             "identity already initialised — to reinitialise, remove the `public_key` field from {path}"
-        );
+        )))?;
     }
 
     // Generate a new identity
@@ -54,9 +55,9 @@ pub async fn status(ctx: &OutputContext) -> Result<()> {
             let identity = Identity::load_from_keyring()?;
             let stored_pk = identity.public_key_base64();
             if stored_pk != *pk {
-                anyhow::bail!(
+                Err(AppError::Crypto(format!(
                     "keyring public key ({stored_pk}) does not match config ({pk}) — identity may be corrupted"
-                );
+                )))?;
             }
 
             // Derive PeerId from the identity keypair.

@@ -74,6 +74,8 @@ impl From<&AppError> for ExitCode {
             AppError::Keyring(_) => ExitCode::IoError,
             AppError::Network(_) => ExitCode::NetworkError,
             AppError::DaemonRequired => ExitCode::DaemonRequired,
+            AppError::InvalidInput(_) => ExitCode::InvalidInput,
+            AppError::NotFound(_) => ExitCode::GeneralError,
             AppError::Other(_) => ExitCode::GeneralError,
         }
     }
@@ -98,6 +100,8 @@ pub enum ErrorCode {
     KeyringError,
     NetworkError,
     DaemonRequired,
+    InvalidInput,
+    NotFound,
     GeneralError,
 }
 
@@ -112,6 +116,8 @@ impl From<&AppError> for ErrorCode {
             AppError::Keyring(_) => ErrorCode::KeyringError,
             AppError::Network(_) => ErrorCode::NetworkError,
             AppError::DaemonRequired => ErrorCode::DaemonRequired,
+            AppError::InvalidInput(_) => ErrorCode::InvalidInput,
+            AppError::NotFound(_) => ErrorCode::NotFound,
             AppError::Other(_) => ErrorCode::GeneralError,
         }
     }
@@ -157,7 +163,7 @@ impl JsonError {
         let code = ErrorCode::from(err);
         let exit_code = ExitCode::from(err) as u8;
         let message = err.to_string();
-        let suggestions = suggestions_for(err);
+        let suggestions = err.suggestions();
 
         Self {
             ok: false,
@@ -168,22 +174,6 @@ impl JsonError {
                 exit_code,
             },
         }
-    }
-}
-
-/// Return actionable suggestions for known error classes.
-fn suggestions_for(err: &AppError) -> Vec<String> {
-    match err {
-        AppError::DaemonRequired => {
-            vec!["Start the daemon with `slashmail daemon`".into()]
-        }
-        AppError::ConfigParse { path, .. } => {
-            vec![format!("Check TOML syntax in {}", path.display())]
-        }
-        AppError::Keyring(_) => {
-            vec!["Run `slashmail init` to create an identity".into()]
-        }
-        _ => vec![],
     }
 }
 
@@ -316,6 +306,19 @@ mod tests {
     }
 
     #[test]
+    fn exit_code_from_invalid_input() {
+        let err = AppError::InvalidInput("bad arg".into());
+        assert_eq!(ExitCode::from(&err), ExitCode::InvalidInput);
+        assert_eq!(ExitCode::InvalidInput.as_i32(), 2);
+    }
+
+    #[test]
+    fn exit_code_from_not_found() {
+        let err = AppError::NotFound("missing thing".into());
+        assert_eq!(ExitCode::from(&err), ExitCode::GeneralError);
+    }
+
+    #[test]
     fn exit_code_success_is_zero() {
         assert_eq!(ExitCode::Success.as_i32(), 0);
     }
@@ -350,6 +353,8 @@ mod tests {
         assert_eq!(ErrorCode::from(&AppError::Network("x".into())), ErrorCode::NetworkError);
         assert_eq!(ErrorCode::from(&AppError::Crypto("x".into())), ErrorCode::CryptoError);
         assert_eq!(ErrorCode::from(&AppError::Other("x".into())), ErrorCode::GeneralError);
+        assert_eq!(ErrorCode::from(&AppError::InvalidInput("x".into())), ErrorCode::InvalidInput);
+        assert_eq!(ErrorCode::from(&AppError::NotFound("x".into())), ErrorCode::NotFound);
         assert_eq!(
             ErrorCode::from(&AppError::Io {
                 path: PathBuf::from("/x"),
@@ -453,5 +458,113 @@ mod tests {
     fn error_code_config_parse_serializes() {
         let s = serde_json::to_string(&ErrorCode::ConfigParse).unwrap();
         assert_eq!(s, "\"config_parse\"");
+    }
+
+    #[test]
+    fn error_code_invalid_input_serializes() {
+        let s = serde_json::to_string(&ErrorCode::InvalidInput).unwrap();
+        assert_eq!(s, "\"invalid_input\"");
+    }
+
+    #[test]
+    fn error_code_not_found_serializes() {
+        let s = serde_json::to_string(&ErrorCode::NotFound).unwrap();
+        assert_eq!(s, "\"not_found\"");
+    }
+
+    // -- Suggestions ----------------------------------------------------------
+
+    #[test]
+    fn suggestions_daemon_required() {
+        let err = AppError::DaemonRequired;
+        let s = err.suggestions();
+        assert!(!s.is_empty());
+        assert!(s[0].contains("daemon"));
+    }
+
+    #[test]
+    fn suggestions_config_parse() {
+        let err = AppError::ConfigParse {
+            path: PathBuf::from("/etc/slashmail.toml"),
+            source: toml::from_str::<toml::Value>("= bad").unwrap_err(),
+        };
+        let s = err.suggestions();
+        assert!(!s.is_empty());
+        assert!(s[0].contains("TOML"));
+    }
+
+    #[test]
+    fn suggestions_keyring() {
+        let err = AppError::Keyring(keyring::Error::NoEntry);
+        let s = err.suggestions();
+        assert!(!s.is_empty());
+        assert!(s[0].contains("init"));
+    }
+
+    #[test]
+    fn suggestions_not_found() {
+        let err = AppError::NotFound("no such message".into());
+        let s = err.suggestions();
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn suggestions_invalid_input() {
+        let err = AppError::InvalidInput("bad argument".into());
+        let s = err.suggestions();
+        assert!(!s.is_empty());
+        assert!(s[0].contains("--help"));
+    }
+
+    #[test]
+    fn suggestions_network() {
+        let err = AppError::Network("connection refused".into());
+        let s = err.suggestions();
+        assert!(s.len() >= 2);
+    }
+
+    #[test]
+    fn suggestions_other_is_empty() {
+        let err = AppError::Other("misc".into());
+        assert!(err.suggestions().is_empty());
+    }
+
+    // -- JSON envelope for new variants ---------------------------------------
+
+    #[test]
+    fn json_error_envelope_invalid_input() {
+        let err = AppError::InvalidInput("bad arg".into());
+        let envelope = JsonError::from_app_error(&err);
+        let json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "invalid_input");
+        assert_eq!(json["error"]["exit_code"], 2);
+        assert!(json["error"]["message"].as_str().unwrap().contains("bad arg"));
+        assert!(!json["error"]["suggestions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_error_envelope_not_found() {
+        let err = AppError::NotFound("message xyz not found".into());
+        let envelope = JsonError::from_app_error(&err);
+        let json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "not_found");
+        assert!(json["error"]["message"].as_str().unwrap().contains("xyz"));
+        assert!(!json["error"]["suggestions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_error_envelope_network() {
+        let err = AppError::Network("connection refused".into());
+        let envelope = JsonError::from_app_error(&err);
+        let json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(json["error"]["code"], "network_error");
+        assert_eq!(json["error"]["exit_code"], 5);
+        // Network errors now have suggestions
+        assert!(!json["error"]["suggestions"].as_array().unwrap().is_empty());
     }
 }

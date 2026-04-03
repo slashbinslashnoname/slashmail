@@ -299,13 +299,13 @@ pub async fn run(args: Args) -> Result<()> {
                     ok: false, error, ..
                 } => {
                     let msg = error.unwrap_or_else(|| "unknown error".into());
-                    anyhow::bail!("failed to send message: {msg}");
+                    Err(AppError::Network(format!("failed to send message: {msg}")))?
                 }
                 CtlResponse::Error { message } => {
-                    anyhow::bail!("daemon error: {message}");
+                    Err(AppError::Network(format!("daemon error: {message}")))?
                 }
                 _ => {
-                    anyhow::bail!("unexpected response from daemon");
+                    Err(AppError::Network("unexpected response from daemon".into()))?
                 }
             }
         }
@@ -368,13 +368,13 @@ pub async fn run(args: Args) -> Result<()> {
                     error,
                 } => {
                     let msg = error.unwrap_or_else(|| "unknown error".into());
-                    anyhow::bail!("failed to add peer: {msg}");
+                    Err(AppError::Network(format!("failed to add peer: {msg}")))?
                 }
                 CtlResponse::Error { message } => {
-                    anyhow::bail!("daemon error: {message}");
+                    Err(AppError::Network(format!("daemon error: {message}")))?
                 }
                 _ => {
-                    anyhow::bail!("unexpected response from daemon");
+                    Err(AppError::Network("unexpected response from daemon".into()))?
                 }
             }
         }
@@ -417,10 +417,10 @@ pub async fn run(args: Args) -> Result<()> {
                     Ok(())
                 }
                 CtlResponse::Error { message } => {
-                    anyhow::bail!("daemon error: {message}");
+                    Err(AppError::Network(format!("daemon error: {message}")))?
                 }
                 _ => {
-                    anyhow::bail!("unexpected response from daemon");
+                    Err(AppError::Network("unexpected response from daemon".into()))?
                 }
             }
         }
@@ -493,16 +493,18 @@ async fn run_daemon_stop() -> Result<()> {
     use nix::unistd::Pid;
 
     let pid = read_pid_file()?.ok_or_else(|| {
-        anyhow::anyhow!("no PID file found — daemon is not running")
+        AppError::NotFound("no PID file found — daemon is not running".into())
     })?;
 
     if !is_pid_alive(pid) {
         remove_pid_file();
-        anyhow::bail!("daemon is not running (stale PID file for pid {pid})");
+        Err(AppError::NotFound(format!(
+            "daemon is not running (stale PID file for pid {pid})"
+        )))?;
     }
 
     signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
-        .map_err(|e| anyhow::anyhow!("failed to send SIGTERM to pid {pid}: {e}"))?;
+        .map_err(|e| AppError::Other(format!("failed to send SIGTERM to pid {pid}: {e}")))?;
 
     // Wait briefly for the process to exit, then clean up the PID file.
     for _ in 0..50 {
@@ -529,7 +531,9 @@ async fn run_daemon_start(listen: String) -> Result<()> {
     // Check for an already-running daemon via PID file.
     if let Some(pid) = read_pid_file()? {
         if is_pid_alive(pid) {
-            anyhow::bail!("daemon is already running (pid {pid})");
+            Err(AppError::InvalidInput(format!(
+                "daemon is already running (pid {pid})"
+            )))?;
         }
         // Stale PID file — clean it up.
         remove_pid_file();
@@ -541,21 +545,21 @@ async fn run_daemon_start(listen: String) -> Result<()> {
 
     let listen_addr: Multiaddr = listen
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid listen address: {e}"))?;
+        .map_err(|e| AppError::InvalidInput(format!("invalid listen address: {e}")))?;
     swarm
         .listen_on(listen_addr)
-        .map_err(|e| anyhow::anyhow!("failed to listen: {e}"))?;
+        .map_err(|e| AppError::Network(format!("failed to listen: {e}")))?;
 
     // When relay_addr is configured, listen through the relay so that
     // dcutr can hole-punch connections for NATed peers.
     if let Some(ref relay) = config.relay_addr {
         let relay_addr: Multiaddr = relay
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid relay_addr in config: {e}"))?;
+            .map_err(|e| AppError::InvalidInput(format!("invalid relay_addr in config: {e}")))?;
         let relay_listen = relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
         swarm
             .listen_on(relay_listen)
-            .map_err(|e| anyhow::anyhow!("failed to listen on relay: {e}"))?;
+            .map_err(|e| AppError::Network(format!("failed to listen on relay: {e}")))?;
         println!("Relay:   {relay}");
     }
 
