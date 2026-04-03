@@ -54,6 +54,7 @@ toml = "0.8"
 sha2 = "0.10"
 
 # Terminal UI
+tabled = "~0.15"
 termimad = "0.30"
 
 # Async
