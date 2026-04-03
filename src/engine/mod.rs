@@ -1520,8 +1520,9 @@ fn handle_sync_inbound_response(
 /// - Tags are plaintext strings.
 ///
 /// In both cases the Ed25519 signature on the payload is verified before processing.
-/// Process an inbound envelope, returning `true` if the message was newly
-/// stored or `false` if it was a duplicate that already existed.
+///
+/// Returns `true` if the message was newly stored, `false` if it was a duplicate
+/// that already existed.
 fn process_inbound_envelope(
     data: &[u8],
     keypair: &Keypair,

@@ -184,11 +184,6 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Insert a message into the store.
-    ///
-    /// Uses `INSERT OR IGNORE` so that duplicate messages (same `id`) received
-    /// during concurrent sync sessions are silently skipped rather than causing
-    /// a constraint-violation error.
     /// Check whether a message with the given ID already exists.
     pub fn has_message(&self, id: &Uuid) -> Result<bool, AppError> {
         let exists: bool = self.conn.query_row(
@@ -199,6 +194,11 @@ impl MessageStore {
         Ok(exists)
     }
 
+    /// Insert a message into the store.
+    ///
+    /// Uses `INSERT OR IGNORE` so that duplicate messages (same `id`) received
+    /// during concurrent sync sessions are silently skipped rather than causing
+    /// a constraint-violation error.
     pub fn insert_message(&self, msg: &Message) -> Result<(), AppError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read)
