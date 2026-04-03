@@ -6,6 +6,9 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use uuid::Uuid;
 
+/// Current schema version.
+const SCHEMA_VERSION: i64 = 1;
+
 /// A stored message with searchable text fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
@@ -17,6 +20,7 @@ pub struct Message {
     pub recipient: String,
     pub subject: String,
     pub body: String,
+    pub tags: String,
     pub created_at: DateTime<Utc>,
     pub read: bool,
 }
@@ -63,8 +67,45 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Run schema migrations: messages table, FTS5 virtual table, and triggers.
+    /// Return the current schema version (0 if no migrations have run).
+    pub fn schema_version(&self) -> Result<i64, AppError> {
+        // db_migrations table may not exist yet.
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_migrations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(0);
+        }
+        let version: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM db_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(version)
+    }
+
+    /// Run schema migrations up to SCHEMA_VERSION.
     fn migrate(&self) -> Result<(), AppError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS db_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+
+        let current = self.schema_version()?;
+
+        if current < 1 {
+            self.migrate_v1()?;
+        }
+
+        Ok(())
+    }
+
+    /// V1: messages, message_tags, FTS5 with tags column, sync triggers.
+    fn migrate_v1(&self) -> Result<(), AppError> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 id             TEXT PRIMARY KEY,
@@ -75,6 +116,7 @@ impl MessageStore {
                 recipient      TEXT NOT NULL,
                 subject        TEXT NOT NULL DEFAULT '',
                 body           TEXT NOT NULL DEFAULT '',
+                tags           TEXT NOT NULL DEFAULT '',
                 created_at     TEXT NOT NULL DEFAULT (datetime('now')),
                 read           INTEGER NOT NULL DEFAULT 0
             );
@@ -84,35 +126,38 @@ impl MessageStore {
                 recipient,
                 subject,
                 body,
+                tags,
                 content='messages',
                 content_rowid='rowid'
             );
 
             -- Triggers to keep FTS index in sync with messages table.
             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, sender, recipient, subject, body)
-                VALUES (new.rowid, new.sender, new.recipient, new.subject, new.body);
+                INSERT INTO messages_fts(rowid, sender, recipient, subject, body, tags)
+                VALUES (new.rowid, new.sender, new.recipient, new.subject, new.body, new.tags);
             END;
 
             CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, sender, recipient, subject, body)
-                VALUES ('delete', old.rowid, old.sender, old.recipient, old.subject, old.body);
+                INSERT INTO messages_fts(messages_fts, rowid, sender, recipient, subject, body, tags)
+                VALUES ('delete', old.rowid, old.sender, old.recipient, old.subject, old.body, old.tags);
             END;
 
             CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, sender, recipient, subject, body)
-                VALUES ('delete', old.rowid, old.sender, old.recipient, old.subject, old.body);
-                INSERT INTO messages_fts(rowid, sender, recipient, subject, body)
-                VALUES (new.rowid, new.sender, new.recipient, new.subject, new.body);
+                INSERT INTO messages_fts(messages_fts, rowid, sender, recipient, subject, body, tags)
+                VALUES ('delete', old.rowid, old.sender, old.recipient, old.subject, old.body, old.tags);
+                INSERT INTO messages_fts(rowid, sender, recipient, subject, body, tags)
+                VALUES (new.rowid, new.sender, new.recipient, new.subject, new.body, new.tags);
             END;
 
             CREATE TABLE IF NOT EXISTS message_tags (
-                message_id  TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                envelope_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                 tag         TEXT NOT NULL,
-                PRIMARY KEY (message_id, tag)
+                PRIMARY KEY (envelope_id, tag)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag);",
+            CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag);
+
+            INSERT INTO db_migrations (version) VALUES (1);",
         )?;
         Ok(())
     }
@@ -120,8 +165,8 @@ impl MessageStore {
     /// Insert a message into the store.
     pub fn insert_message(&self, msg: &Message) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 msg.id.to_string(),
                 msg.swarm_id,
@@ -131,6 +176,7 @@ impl MessageStore {
                 msg.recipient,
                 msg.subject,
                 msg.body,
+                msg.tags,
                 msg.created_at.to_rfc3339(),
                 msg.read as i32,
             ],
@@ -143,7 +189,7 @@ impl MessageStore {
     pub fn list_messages(&self, limit: u32) -> Result<Vec<Message>, AppError> {
         let limit_val: i64 = if limit > 0 { limit as i64 } else { -1 };
         let mut stmt = self.conn.prepare(
-            "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, created_at, read
+            "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read
              FROM messages ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit_val], row_to_message)?;
@@ -154,11 +200,11 @@ impl MessageStore {
         Ok(messages)
     }
 
-    /// Full-text search across sender, recipient, subject, and body.
+    /// Full-text search across sender, recipient, subject, body, and tags.
     /// Uses FTS5 match syntax.
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>, AppError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.created_at, m.read
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.tags, m.created_at, m.read
              FROM messages m
              JOIN messages_fts fts ON m.rowid = fts.rowid
              WHERE messages_fts MATCH ?1
@@ -178,29 +224,68 @@ impl MessageStore {
     }
 
     /// Add a tag to a message. Does nothing if the tag already exists.
-    pub fn tag_message(&self, message_id: &Uuid, tag: &str) -> Result<(), AppError> {
+    pub fn tag_message(&self, envelope_id: &Uuid, tag: &str) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO message_tags (message_id, tag) VALUES (?1, ?2)",
-            params![message_id.to_string(), tag],
+            "INSERT OR IGNORE INTO message_tags (envelope_id, tag) VALUES (?1, ?2)",
+            params![envelope_id.to_string(), tag],
         )?;
+        self.refresh_tags_text(envelope_id)?;
+        Ok(())
+    }
+
+    /// Idempotently set the full set of tags for a message.
+    /// Inserts missing tags and removes tags not in the provided list.
+    pub fn upsert_tags(&self, envelope_id: &Uuid, tags: &[&str]) -> Result<(), AppError> {
+        let id_str = envelope_id.to_string();
+        // Insert any new tags (idempotent via INSERT OR IGNORE).
+        for tag in tags {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO message_tags (envelope_id, tag) VALUES (?1, ?2)",
+                params![id_str, *tag],
+            )?;
+        }
+        // Remove tags not in the provided list.
+        if tags.is_empty() {
+            self.conn.execute(
+                "DELETE FROM message_tags WHERE envelope_id = ?1",
+                params![id_str],
+            )?;
+        } else {
+            // Build a comma-separated placeholder list for the IN clause.
+            let placeholders: Vec<String> = (0..tags.len()).map(|i| format!("?{}", i + 2)).collect();
+            let sql = format!(
+                "DELETE FROM message_tags WHERE envelope_id = ?1 AND tag NOT IN ({})",
+                placeholders.join(", ")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut param_idx = 1;
+            stmt.raw_bind_parameter(param_idx, &id_str)?;
+            for tag in tags {
+                param_idx += 1;
+                stmt.raw_bind_parameter(param_idx, *tag)?;
+            }
+            stmt.raw_execute()?;
+        }
+        self.refresh_tags_text(envelope_id)?;
         Ok(())
     }
 
     /// Remove a tag from a message.
-    pub fn untag_message(&self, message_id: &Uuid, tag: &str) -> Result<(), AppError> {
+    pub fn untag_message(&self, envelope_id: &Uuid, tag: &str) -> Result<(), AppError> {
         self.conn.execute(
-            "DELETE FROM message_tags WHERE message_id = ?1 AND tag = ?2",
-            params![message_id.to_string(), tag],
+            "DELETE FROM message_tags WHERE envelope_id = ?1 AND tag = ?2",
+            params![envelope_id.to_string(), tag],
         )?;
+        self.refresh_tags_text(envelope_id)?;
         Ok(())
     }
 
     /// Get all tags for a given message.
-    pub fn get_message_tags(&self, message_id: &Uuid) -> Result<Vec<String>, AppError> {
+    pub fn get_message_tags(&self, envelope_id: &Uuid) -> Result<Vec<String>, AppError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT tag FROM message_tags WHERE message_id = ?1 ORDER BY tag")?;
-        let rows = stmt.query_map(params![message_id.to_string()], |row| row.get(0))?;
+            .prepare("SELECT tag FROM message_tags WHERE envelope_id = ?1 ORDER BY tag")?;
+        let rows = stmt.query_map(params![envelope_id.to_string()], |row| row.get(0))?;
         let mut tags = Vec::new();
         for row in rows {
             tags.push(row?);
@@ -209,11 +294,11 @@ impl MessageStore {
     }
 
     /// Get all messages with a given tag, ordered by creation time (newest first).
-    pub fn get_messages_by_tag(&self, tag: &str) -> Result<Vec<Message>, AppError> {
+    pub fn messages_by_tag(&self, tag: &str) -> Result<Vec<Message>, AppError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.created_at, m.read
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.tags, m.created_at, m.read
              FROM messages m
-             JOIN message_tags mt ON m.id = mt.message_id
+             JOIN message_tags mt ON m.id = mt.envelope_id
              WHERE mt.tag = ?1
              ORDER BY m.created_at DESC",
         )?;
@@ -224,15 +309,30 @@ impl MessageStore {
         }
         Ok(messages)
     }
+
+    /// Refresh the denormalized tags column in messages from message_tags.
+    fn refresh_tags_text(&self, envelope_id: &Uuid) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE messages SET tags = (
+                SELECT COALESCE(GROUP_CONCAT(tag, ' '), '')
+                FROM message_tags WHERE envelope_id = ?1
+            ) WHERE id = ?1",
+            params![envelope_id.to_string()],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+    // Column order: id(0), swarm_id(1), folder_path(2), sender_pubkey(3),
+    //   sender(4), recipient(5), subject(6), body(7), tags(8), created_at(9), read(10)
     let id_str: String = row.get(0)?;
     let swarm_id: String = row.get(1)?;
     let folder_path: String = row.get(2)?;
     let pubkey_blob: Vec<u8> = row.get(3)?;
-    let created_str: String = row.get(8)?;
-    let read_int: i32 = row.get(9)?;
+    let tags: String = row.get(8)?;
+    let created_str: String = row.get(9)?;
+    let read_int: i32 = row.get(10)?;
 
     let id = Uuid::parse_str(&id_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
@@ -255,7 +355,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc())
         })
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e)))?;
 
     Ok(Message {
         id,
@@ -266,6 +366,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         recipient: row.get(5)?,
         subject: row.get(6)?,
         body: row.get(7)?,
+        tags,
         created_at,
         read: read_int != 0,
     })
@@ -285,6 +386,7 @@ mod tests {
             recipient: recipient.to_string(),
             subject: subject.to_string(),
             body: body.to_string(),
+            tags: String::new(),
             created_at: Utc::now(),
             read: false,
         }
@@ -404,6 +506,7 @@ mod tests {
             recipient: "bob".to_string(),
             subject: "Test Subject".to_string(),
             body: "Test Body".to_string(),
+            tags: String::new(),
             created_at: Utc::now(),
             read: true,
         };
@@ -551,25 +654,25 @@ mod tests {
         store.tag_message(&m2.id, "important").unwrap();
         store.tag_message(&m3.id, "spam").unwrap();
 
-        let important = store.get_messages_by_tag("important").unwrap();
+        let important = store.messages_by_tag("important").unwrap();
         assert_eq!(important.len(), 2);
         let senders: Vec<&str> = important.iter().map(|m| m.sender.as_str()).collect();
         assert!(senders.contains(&"alice"));
         assert!(senders.contains(&"carol"));
 
-        let spam = store.get_messages_by_tag("spam").unwrap();
+        let spam = store.messages_by_tag("spam").unwrap();
         assert_eq!(spam.len(), 1);
         assert_eq!(spam[0].sender, "dave");
     }
 
     #[test]
-    fn get_messages_by_tag_returns_empty_for_unknown_tag() {
+    fn messages_by_tag_returns_empty_for_unknown_tag() {
         let store = MessageStore::open_memory().unwrap();
         let m = make_message("alice", "bob", "Hi", "Hello");
         store.insert_message(&m).unwrap();
         store.tag_message(&m.id, "inbox").unwrap();
 
-        let results = store.get_messages_by_tag("nonexistent").unwrap();
+        let results = store.messages_by_tag("nonexistent").unwrap();
         assert!(results.is_empty());
     }
 
@@ -588,7 +691,7 @@ mod tests {
         let tags = store.get_message_tags(&m.id).unwrap();
         assert!(tags.is_empty());
 
-        let by_tag = store.get_messages_by_tag("inbox").unwrap();
+        let by_tag = store.messages_by_tag("inbox").unwrap();
         assert!(by_tag.is_empty());
     }
 
@@ -630,5 +733,109 @@ mod tests {
         assert_eq!(results[0].swarm_id, "pub_room");
         assert_eq!(results[0].folder_path, "Archive");
         assert_eq!(results[0].sender_pubkey, [0xCC; 32]);
+    }
+
+    #[test]
+    fn schema_version_tracks_migrations() {
+        let store = MessageStore::open_memory().unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        // db_migrations table has exactly one row
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM db_migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_with_versioning() {
+        let store = MessageStore::open_memory().unwrap();
+        // Running migrate again should not error or duplicate rows.
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM db_migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn upsert_tags_sets_tags() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["important", "inbox"]);
+    }
+
+    #[test]
+    fn upsert_tags_is_idempotent() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["important", "inbox"]);
+    }
+
+    #[test]
+    fn upsert_tags_removes_old_tags() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["inbox", "important", "urgent"]).unwrap();
+        store.upsert_tags(&m.id, &["inbox"]).unwrap();
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["inbox"]);
+    }
+
+    #[test]
+    fn upsert_tags_empty_clears_all() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+        store.upsert_tags(&m.id, &[]).unwrap();
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn upsert_tags_syncs_denormalized_tags_text() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+
+        let all = store.list_messages(0).unwrap();
+        // tags_text is space-separated, order determined by GROUP_CONCAT
+        let tags_words: Vec<&str> = all[0].tags.split_whitespace().collect();
+        assert!(tags_words.contains(&"inbox"));
+        assert!(tags_words.contains(&"important"));
+    }
+
+    #[test]
+    fn fts5_searches_tags() {
+        let store = MessageStore::open_memory().unwrap();
+        let m1 = make_message("alice", "bob", "Hi", "Hello world");
+        let m2 = make_message("carol", "bob", "Hey", "Goodbye world");
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+
+        store.upsert_tags(&m1.id, &["urgent"]).unwrap();
+
+        let results = store.search_messages("tags:urgent").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sender, "alice");
     }
 }
