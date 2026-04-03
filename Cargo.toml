@@ -29,10 +29,11 @@ libp2p = { version = "0.54", features = [
 ] }
 
 # Cryptography
-ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -7,4 +7,4 @@ pub mod ecdh;
 
 pub use signing::{Keypair, PublicKey, Signature};
 pub use encryption::{seal, open, generate_nonce};
-pub use ecdh::{derive_shared_secret, seal_for, open_from};
+pub use ecdh::{derive_shared_secret, seal_for, open_from, SharedSecret};

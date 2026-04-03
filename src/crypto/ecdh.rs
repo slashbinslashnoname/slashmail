@@ -2,18 +2,30 @@
 //!
 //! Converts Ed25519 signing keys to X25519 Diffie-Hellman keys, then computes
 //! a shared secret suitable for use with XChaCha20-Poly1305.
+//!
+//! All types holding key material derive [`Zeroize`] and [`ZeroizeOnDrop`] so
+//! secrets are scrubbed from memory when they go out of scope.
 
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::signing::{Keypair, PublicKey};
 
 /// An X25519 static secret derived from an Ed25519 signing key.
+///
+/// The inner `StaticSecret` implements `Zeroize + ZeroizeOnDrop` via
+/// the x25519-dalek `zeroize` feature; we derive the same on the wrapper.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct X25519Secret(StaticSecret);
 
 /// An X25519 public key derived from an Ed25519 verifying key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X25519Public(X25519DalekPublicKey);
+
+/// A 32-byte shared secret derived from ECDH, zeroized on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SharedSecret([u8; 32]);
 
 /// Derive an X25519 static secret from an Ed25519 signing key.
 ///
@@ -21,8 +33,8 @@ pub struct X25519Public(X25519DalekPublicKey);
 /// from the SHA-512 expansion of the Ed25519 seed — the standard
 /// Ed25519-to-X25519 conversion (RFC 7748 / libsodium `crypto_sign_ed25519_sk_to_curve25519`).
 pub fn ed25519_to_x25519_secret(signing_key: &Keypair) -> X25519Secret {
-    let scalar_bytes = signing_key.to_scalar_bytes();
-    X25519Secret(StaticSecret::from(scalar_bytes))
+    let scalar_bytes = Zeroizing::new(signing_key.to_scalar_bytes());
+    X25519Secret(StaticSecret::from(*scalar_bytes))
 }
 
 /// Derive an X25519 public key from an Ed25519 verifying key.
@@ -39,14 +51,23 @@ pub fn ed25519_to_x25519_public(verifying_key: &PublicKey) -> X25519Public {
 /// Performs Ed25519→X25519 conversion on both keys, then runs X25519 ECDH.
 /// The raw DH output is hashed with SHA-256 to produce a uniform 256-bit key
 /// suitable for XChaCha20-Poly1305.
-pub fn derive_shared_secret(our_key: &Keypair, their_key: &PublicKey) -> [u8; 32] {
+///
+/// Returns a [`SharedSecret`] that is zeroized when dropped.
+pub fn derive_shared_secret(our_key: &Keypair, their_key: &PublicKey) -> SharedSecret {
     let our_secret = ed25519_to_x25519_secret(our_key);
     let their_public = ed25519_to_x25519_public(their_key);
     let raw_shared = our_secret.0.diffie_hellman(&their_public.0);
     // Hash the raw DH output to get a uniform key
     let mut hasher = Sha256::new();
     hasher.update(raw_shared.as_bytes());
-    hasher.finalize().into()
+    SharedSecret(hasher.finalize().into())
+}
+
+impl SharedSecret {
+    /// Access the raw 32-byte key material.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 /// Encrypt a message for a specific recipient using ECDH-derived shared secret.
@@ -59,7 +80,7 @@ pub fn seal_for(
     plaintext: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let shared = derive_shared_secret(our_key, their_key);
-    super::encryption::seal(&shared, plaintext)
+    super::encryption::seal(shared.as_bytes(), plaintext)
 }
 
 /// Decrypt a message from a specific sender using ECDH-derived shared secret.
@@ -72,7 +93,7 @@ pub fn open_from(
     data: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let shared = derive_shared_secret(our_key, their_key);
-    super::encryption::open(&shared, data)
+    super::encryption::open(shared.as_bytes(), data)
 }
 
 #[cfg(test)]
@@ -97,7 +118,7 @@ mod tests {
         let bob = generate_keypair();
         let secret_ab = derive_shared_secret(&alice, &bob.verifying_key());
         let secret_ba = derive_shared_secret(&bob, &alice.verifying_key());
-        assert_eq!(secret_ab, secret_ba);
+        assert_eq!(secret_ab.as_bytes(), secret_ba.as_bytes());
     }
 
     #[test]
@@ -107,7 +128,7 @@ mod tests {
         let carol = generate_keypair();
         let ab = derive_shared_secret(&alice, &bob.verifying_key());
         let ac = derive_shared_secret(&alice, &carol.verifying_key());
-        assert_ne!(ab, ac);
+        assert_ne!(ab.as_bytes(), ac.as_bytes());
     }
 
     #[test]
@@ -145,7 +166,7 @@ mod tests {
         let alice = generate_keypair();
         let bob = generate_keypair();
         let secret = derive_shared_secret(&alice, &bob.verifying_key());
-        assert_eq!(secret.len(), 32);
+        assert_eq!(secret.as_bytes().len(), 32);
     }
 
     #[test]
@@ -156,5 +177,19 @@ mod tests {
         let encrypted = seal_for(&alice, &alice.verifying_key(), msg).unwrap();
         let decrypted = open_from(&alice, &alice.verifying_key(), &encrypted).unwrap();
         assert_eq!(decrypted, msg);
+    }
+
+    #[test]
+    fn x25519_secret_is_zeroize_on_drop() {
+        // Compile-time proof: X25519Secret derives Zeroize + ZeroizeOnDrop.
+        // If the derives were removed, this test would fail to compile.
+        fn assert_zeroize<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize::<X25519Secret>();
+    }
+
+    #[test]
+    fn shared_secret_is_zeroize_on_drop() {
+        fn assert_zeroize<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize::<SharedSecret>();
     }
 }
