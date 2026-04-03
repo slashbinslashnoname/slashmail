@@ -1,6 +1,9 @@
 //! Engine: central event loop multiplexing swarm events, CLI commands, and OS signals.
 
+use std::time::Duration;
+
 use futures::StreamExt;
+use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, Swarm};
 use tokio::signal::unix::{signal, SignalKind};
@@ -8,6 +11,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::net::behaviour::{SlashmailBehaviour, SlashmailBehaviourEvent};
+use crate::net::rr::{MailRequest, MailResponse};
+
+/// Duration to wait for in-flight requests to drain during shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Commands sent from the CLI (or other callers) to the engine via an mpsc channel.
 #[derive(Debug)]
@@ -42,26 +49,31 @@ pub enum ShutdownReason {
 /// - CLI commands arriving on `cmd_rx`
 /// - OS signals (SIGINT / SIGTERM) for graceful shutdown
 ///
+/// On shutdown: drains in-flight request-response exchanges (up to 5 s timeout),
+/// then calls the optional `wal_flush` callback to checkpoint the SQLite WAL.
+///
 /// Returns the reason the loop exited.
 pub async fn run_loop(
     mut swarm: Swarm<SlashmailBehaviour>,
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
+    wal_flush: Option<Box<dyn FnOnce() + Send>>,
 ) -> ShutdownReason {
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut in_flight: usize = 0;
 
     info!("engine event loop started");
 
-    loop {
+    let reason = loop {
         tokio::select! {
             // --- OS signals ---
             _ = sigint.recv() => {
-                info!("received SIGINT, shutting down");
-                return ShutdownReason::Signal;
+                info!("received SIGINT, starting graceful shutdown");
+                break ShutdownReason::Signal;
             }
             _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
-                return ShutdownReason::Signal;
+                info!("received SIGTERM, starting graceful shutdown");
+                break ShutdownReason::Signal;
             }
 
             // --- CLI commands ---
@@ -69,19 +81,65 @@ pub async fn run_loop(
                 match cmd {
                     Some(command) => {
                         if let Some(reason) = handle_command(&mut swarm, command) {
-                            return reason;
+                            break reason;
                         }
                     }
                     None => {
                         info!("command channel closed, shutting down");
-                        return ShutdownReason::ChannelClosed;
+                        break ShutdownReason::ChannelClosed;
                     }
                 }
             }
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                handle_swarm_event(event);
+                handle_swarm_event(event, &mut in_flight);
+            }
+        }
+    };
+
+    // --- Graceful shutdown sequence ---
+    drain_in_flight(&mut swarm, &mut in_flight).await;
+
+    if let Some(flush) = wal_flush {
+        info!("flushing SQLite WAL checkpoint");
+        flush();
+        info!("WAL flush complete");
+    }
+
+    info!(?reason, "engine shutdown complete");
+    reason
+}
+
+/// Drain in-flight request-response exchanges, waiting up to [`DRAIN_TIMEOUT`].
+async fn drain_in_flight(
+    swarm: &mut Swarm<SlashmailBehaviour>,
+    in_flight: &mut usize,
+) {
+    if *in_flight == 0 {
+        debug!("no in-flight requests to drain");
+        return;
+    }
+
+    info!(in_flight = *in_flight, "draining in-flight requests");
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                warn!(
+                    remaining = *in_flight,
+                    "drain timeout reached after {}s, proceeding with shutdown",
+                    DRAIN_TIMEOUT.as_secs()
+                );
+                break;
+            }
+            event = swarm.select_next_some() => {
+                handle_swarm_event(event, in_flight);
+                if *in_flight == 0 {
+                    info!("all in-flight requests drained");
+                    break;
+                }
             }
         }
     }
@@ -132,10 +190,20 @@ fn handle_command(
     }
 }
 
-/// Process a single swarm event. Logs the event for now; downstream beads will
-/// add message handling, peer management, etc.
-fn handle_swarm_event(event: SwarmEvent<SlashmailBehaviourEvent>) {
-    match &event {
+/// Process a single swarm event, updating `in_flight` for request-response tracking.
+fn handle_swarm_event(event: SwarmEvent<SlashmailBehaviourEvent>, in_flight: &mut usize) {
+    match event {
+        // --- Request-response events (tracked for graceful drain) ---
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::MailRr(rr_event)) => {
+            handle_rr_event(rr_event, in_flight);
+        }
+
+        // --- Other behaviour events ---
+        SwarmEvent::Behaviour(event) => {
+            debug!(?event, "behaviour event");
+        }
+
+        // --- Connection / listener lifecycle ---
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "new listen address");
         }
@@ -175,8 +243,44 @@ fn handle_swarm_event(event: SwarmEvent<SlashmailBehaviourEvent>) {
         SwarmEvent::ExternalAddrExpired { address, .. } => {
             debug!(%address, "external address expired");
         }
-        _ => {
+        event => {
             debug!(?event, "unhandled swarm event");
+        }
+    }
+}
+
+/// Handle a request-response event, updating the in-flight counter.
+///
+/// The counter is decremented when an outbound request completes (response or failure).
+/// Callers that send outbound requests via `mail_rr.send_request()` must increment
+/// `in_flight` at send time.
+fn handle_rr_event(
+    event: request_response::Event<MailRequest, MailResponse>,
+    in_flight: &mut usize,
+) {
+    match event {
+        request_response::Event::Message { message, peer, .. } => match message {
+            request_response::Message::Response { request_id, .. } => {
+                debug!(%peer, ?request_id, "outbound request got response");
+                *in_flight = in_flight.saturating_sub(1);
+            }
+            request_response::Message::Request { request_id, .. } => {
+                debug!(%peer, ?request_id, "inbound request received");
+            }
+        },
+        request_response::Event::OutboundFailure {
+            request_id, error, peer, ..
+        } => {
+            warn!(%peer, ?request_id, %error, "outbound request failed");
+            *in_flight = in_flight.saturating_sub(1);
+        }
+        request_response::Event::InboundFailure {
+            request_id, error, peer, ..
+        } => {
+            debug!(%peer, ?request_id, %error, "inbound request failed");
+        }
+        request_response::Event::ResponseSent { request_id, peer, .. } => {
+            debug!(%peer, ?request_id, "response sent");
         }
     }
 }
@@ -186,6 +290,8 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
     use crate::net::build_swarm;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// Helper: build a swarm and command channel for tests.
     async fn setup() -> (
@@ -204,7 +310,7 @@ mod tests {
         let (swarm, tx, rx) = setup().await;
 
         tx.send(EngineCommand::Shutdown).await.unwrap();
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -213,7 +319,7 @@ mod tests {
         let (swarm, tx, rx) = setup().await;
 
         drop(tx);
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::ChannelClosed);
     }
 
@@ -228,7 +334,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -243,7 +349,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -258,7 +364,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -274,7 +380,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -304,7 +410,55 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx).await;
+        let reason = run_loop(swarm, rx, None).await;
         assert_eq!(reason, ShutdownReason::Command);
+    }
+
+    #[tokio::test]
+    async fn wal_flush_called_on_shutdown() {
+        let (swarm, tx, rx) = setup().await;
+        let flushed = Arc::new(AtomicBool::new(false));
+        let flushed_clone = flushed.clone();
+
+        let wal_flush: Box<dyn FnOnce() + Send> = Box::new(move || {
+            flushed_clone.store(true, Ordering::SeqCst);
+        });
+
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+        let reason = run_loop(swarm, rx, Some(wal_flush)).await;
+
+        assert_eq!(reason, ShutdownReason::Command);
+        assert!(flushed.load(Ordering::SeqCst), "WAL flush callback must be called on shutdown");
+    }
+
+    #[tokio::test]
+    async fn wal_flush_called_on_channel_close() {
+        let (swarm, tx, rx) = setup().await;
+        let flushed = Arc::new(AtomicBool::new(false));
+        let flushed_clone = flushed.clone();
+
+        let wal_flush: Box<dyn FnOnce() + Send> = Box::new(move || {
+            flushed_clone.store(true, Ordering::SeqCst);
+        });
+
+        drop(tx);
+        let reason = run_loop(swarm, rx, Some(wal_flush)).await;
+
+        assert_eq!(reason, ShutdownReason::ChannelClosed);
+        assert!(flushed.load(Ordering::SeqCst), "WAL flush callback must be called on channel close");
+    }
+
+    #[tokio::test]
+    async fn drain_returns_immediately_when_no_in_flight() {
+        // Verify that drain_in_flight is a no-op with 0 in-flight requests
+        // (i.e., does not block for 5 seconds).
+        let (mut swarm, _tx, _rx) = setup().await;
+        let mut in_flight: usize = 0;
+
+        let start = tokio::time::Instant::now();
+        drain_in_flight(&mut swarm, &mut in_flight).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_millis(100), "drain should return immediately with 0 in-flight");
     }
 }

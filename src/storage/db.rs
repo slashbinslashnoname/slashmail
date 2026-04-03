@@ -218,6 +218,16 @@ impl MessageStore {
         Ok(messages)
     }
 
+    /// Flush the WAL to the main database file via a full checkpoint.
+    ///
+    /// Should be called during graceful shutdown to ensure all writes are
+    /// persisted to the main database file.
+    pub fn flush_wal(&self) -> Result<(), AppError> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        Ok(())
+    }
+
     /// Access the raw connection.
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -547,6 +557,32 @@ mod tests {
         // FTS should no longer find it
         let results = store.search_messages("unique_keyword_xyz").unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn flush_wal_succeeds() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+        // WAL checkpoint should succeed (no-op on in-memory, but must not error).
+        store.flush_wal().unwrap();
+    }
+
+    #[test]
+    fn flush_wal_on_file_based_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("wal_test.db");
+
+        let store = MessageStore::open(&db_path).unwrap();
+        let m = make_message("alice", "bob", "Hi", "WAL flush test");
+        store.insert_message(&m).unwrap();
+
+        store.flush_wal().unwrap();
+
+        // Data should be readable after flush.
+        let all = store.list_messages(0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].body, "WAL flush test");
     }
 
     #[test]
