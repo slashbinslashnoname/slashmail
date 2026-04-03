@@ -326,6 +326,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -1514,9 +1517,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.13.0"
+version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
+checksum = "45a8a2b9cb3e0b0c1803dbb0758ffac5de2f425b23c28f518faabd9d805342ff"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
@@ -1667,10 +1670,7 @@ dependencies = [
  "libp2p-metrics",
  "libp2p-noise",
  "libp2p-quic",
-<<<<<<< HEAD
-=======
  "libp2p-request-response",
->>>>>>> master
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -1725,6 +1725,7 @@ dependencies = [
  "quick-protobuf",
  "rand 0.8.5",
  "rw-stream-sink",
+ "serde",
  "smallvec",
  "thiserror 1.0.69",
  "tracing",
@@ -1773,6 +1774,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.5",
  "regex",
+ "serde",
  "sha2",
  "smallvec",
  "tracing",
@@ -1815,6 +1817,7 @@ dependencies = [
  "multihash",
  "quick-protobuf",
  "rand 0.8.5",
+ "serde",
  "sha2",
  "thiserror 2.0.18",
  "tracing",
@@ -1841,6 +1844,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "rand 0.8.5",
+ "serde",
  "sha2",
  "smallvec",
  "thiserror 1.0.69",
@@ -1940,8 +1944,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-=======
 name = "libp2p-request-response"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1962,7 +1964,6 @@ dependencies = [
 ]
 
 [[package]]
->>>>>>> master
 name = "libp2p-swarm"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2239,6 +2240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b430e7953c29dd6a09afc29ff0bb69c6e306329ee6794700aee27b76a1aea8d"
 dependencies = [
  "core2",
+ "serde",
  "unsigned-varint 0.8.0",
 ]
 
@@ -3129,10 +3131,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slashmail"
 version = "0.1.0"
 dependencies = [
-<<<<<<< HEAD
-=======
  "aes-gcm",
->>>>>>> master
  "anyhow",
  "base64",
  "bincode",
@@ -3143,10 +3142,6 @@ dependencies = [
  "ed25519-dalek",
  "keyring",
  "libp2p",
-<<<<<<< HEAD
-=======
- "libp2p-quic",
->>>>>>> master
  "rand 0.8.5",
  "rusqlite",
  "serde",
@@ -3160,10 +3155,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-<<<<<<< HEAD
-=======
  "x25519-dalek",
->>>>>>> master
  "zstd",
 ]
 
@@ -4260,9 +4252,9 @@ dependencies = [
 
 [[package]]
 name = "writeable"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "x25519-dalek"
