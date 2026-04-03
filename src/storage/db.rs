@@ -104,7 +104,15 @@ impl MessageStore {
                 VALUES ('delete', old.rowid, old.sender, old.recipient, old.subject, old.body);
                 INSERT INTO messages_fts(rowid, sender, recipient, subject, body)
                 VALUES (new.rowid, new.sender, new.recipient, new.subject, new.body);
-            END;",
+            END;
+
+            CREATE TABLE IF NOT EXISTS message_tags (
+                message_id  TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                tag         TEXT NOT NULL,
+                PRIMARY KEY (message_id, tag)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag);",
         )?;
         Ok(())
     }
@@ -167,6 +175,54 @@ impl MessageStore {
     /// Access the raw connection.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Add a tag to a message. Does nothing if the tag already exists.
+    pub fn tag_message(&self, message_id: &Uuid, tag: &str) -> Result<(), AppError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO message_tags (message_id, tag) VALUES (?1, ?2)",
+            params![message_id.to_string(), tag],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a tag from a message.
+    pub fn untag_message(&self, message_id: &Uuid, tag: &str) -> Result<(), AppError> {
+        self.conn.execute(
+            "DELETE FROM message_tags WHERE message_id = ?1 AND tag = ?2",
+            params![message_id.to_string(), tag],
+        )?;
+        Ok(())
+    }
+
+    /// Get all tags for a given message.
+    pub fn get_message_tags(&self, message_id: &Uuid) -> Result<Vec<String>, AppError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM message_tags WHERE message_id = ?1 ORDER BY tag")?;
+        let rows = stmt.query_map(params![message_id.to_string()], |row| row.get(0))?;
+        let mut tags = Vec::new();
+        for row in rows {
+            tags.push(row?);
+        }
+        Ok(tags)
+    }
+
+    /// Get all messages with a given tag, ordered by creation time (newest first).
+    pub fn get_messages_by_tag(&self, tag: &str) -> Result<Vec<Message>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.created_at, m.read
+             FROM messages m
+             JOIN message_tags mt ON m.id = mt.message_id
+             WHERE mt.tag = ?1
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![tag], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
     }
 }
 
@@ -438,6 +494,112 @@ mod tests {
         assert_eq!(all[1].swarm_id, "pub_general");
         assert_eq!(all[1].folder_path, "INBOX/priority");
         assert_eq!(all[1].sender_pubkey, [0x01; 32]);
+    }
+
+    #[test]
+    fn tag_message_and_get_tags() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.tag_message(&m.id, "inbox").unwrap();
+        store.tag_message(&m.id, "important").unwrap();
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["important", "inbox"]); // sorted alphabetically
+    }
+
+    #[test]
+    fn tag_message_is_idempotent() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.tag_message(&m.id, "inbox").unwrap();
+        store.tag_message(&m.id, "inbox").unwrap(); // duplicate, should not error
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["inbox"]);
+    }
+
+    #[test]
+    fn untag_message_removes_tag() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store.tag_message(&m.id, "inbox").unwrap();
+        store.tag_message(&m.id, "important").unwrap();
+        store.untag_message(&m.id, "inbox").unwrap();
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["important"]);
+    }
+
+    #[test]
+    fn get_messages_by_tag() {
+        let store = MessageStore::open_memory().unwrap();
+
+        let m1 = make_message("alice", "bob", "Hi", "Hello");
+        let m2 = make_message("carol", "bob", "Hey", "World");
+        let m3 = make_message("dave", "bob", "Yo", "Sup");
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+        store.insert_message(&m3).unwrap();
+
+        store.tag_message(&m1.id, "important").unwrap();
+        store.tag_message(&m2.id, "important").unwrap();
+        store.tag_message(&m3.id, "spam").unwrap();
+
+        let important = store.get_messages_by_tag("important").unwrap();
+        assert_eq!(important.len(), 2);
+        let senders: Vec<&str> = important.iter().map(|m| m.sender.as_str()).collect();
+        assert!(senders.contains(&"alice"));
+        assert!(senders.contains(&"carol"));
+
+        let spam = store.get_messages_by_tag("spam").unwrap();
+        assert_eq!(spam.len(), 1);
+        assert_eq!(spam[0].sender, "dave");
+    }
+
+    #[test]
+    fn get_messages_by_tag_returns_empty_for_unknown_tag() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+        store.tag_message(&m.id, "inbox").unwrap();
+
+        let results = store.get_messages_by_tag("nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn tags_cascade_on_message_delete() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+        store.tag_message(&m.id, "inbox").unwrap();
+
+        store
+            .conn()
+            .execute("DELETE FROM messages WHERE id = ?1", params![m.id.to_string()])
+            .unwrap();
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert!(tags.is_empty());
+
+        let by_tag = store.get_messages_by_tag("inbox").unwrap();
+        assert!(by_tag.is_empty());
+    }
+
+    #[test]
+    fn get_message_tags_empty_for_untagged() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert!(tags.is_empty());
     }
 
     #[test]
