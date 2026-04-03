@@ -33,6 +33,16 @@ pub use topic_registry::TopicRegistry;
 /// Duration to wait for in-flight requests to drain during shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Duration to wait for gossipsub mesh peers after publishing.
+const GOSSIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Tracks a deferred gossipsub publish reply while we wait for mesh peers.
+struct PendingGossipPublish {
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    deadline: tokio::time::Instant,
+    topic: String,
+}
+
 /// Per-peer tracking state maintained by the engine.
 #[derive(Debug, Clone)]
 struct PeerState {
@@ -110,13 +120,14 @@ pub enum EngineCommand {
     /// Send an encrypted private message to a recipient.
     ///
     /// The engine encrypts the body and tags, signs the envelope, and
-    /// dispatches it via the request-response protocol. The reply carries
-    /// the message UUID on success or an error string on failure.
+    /// dispatches it via the request-response protocol. A copy is always
+    /// stored in the local "Sent" folder. The reply carries
+    /// `(message_id, optional_warning)` on success or an error string on failure.
     SendMessage {
         to: String,
         body: String,
         tags: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(String, Option<String>), String>>,
     },
     /// Request a graceful shutdown.
     Shutdown,
@@ -160,10 +171,18 @@ pub async fn run_loop(
     let mut in_flight: usize = 0;
     let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
     let mut topic_registry = TopicRegistry::new();
+    let mut pending_publishes: Vec<PendingGossipPublish> = Vec::new();
 
     info!("engine event loop started");
 
     let reason = loop {
+        // Compute the nearest pending-publish deadline (if any) for the select.
+        let next_publish_deadline = pending_publishes
+            .iter()
+            .map(|p| p.deadline)
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+
         tokio::select! {
             // --- OS signals ---
             _ = sigint.recv() => {
@@ -179,7 +198,7 @@ pub async fn run_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(command) => {
-                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers, &mut topic_registry, keypair, &mut in_flight) {
+                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers, &mut topic_registry, keypair, &mut in_flight, &mut pending_publishes) {
                             break reason;
                         }
                     }
@@ -194,11 +213,23 @@ pub async fn run_loop(
             event = swarm.select_next_some() => {
                 let action = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry);
                 apply_swarm_action(&mut swarm, action);
+
+                // Check if any pending publish now has mesh peers.
+                resolve_pending_publishes(&mut swarm, &mut pending_publishes, false);
+            }
+
+            // --- Pending gossipsub publish timeout ---
+            _ = tokio::time::sleep_until(next_publish_deadline), if !pending_publishes.is_empty() => {
+                resolve_pending_publishes(&mut swarm, &mut pending_publishes, true);
             }
         }
     };
 
     // --- Graceful shutdown sequence ---
+
+    // Resolve any pending gossipsub publishes immediately (with warning).
+    resolve_pending_publishes(&mut swarm, &mut pending_publishes, true);
+
     drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry).await;
 
     if let Some(flush) = wal_flush {
@@ -259,6 +290,7 @@ fn handle_command(
     topic_registry: &mut TopicRegistry,
     keypair: Option<&Keypair>,
     in_flight: &mut usize,
+    pending_publishes: &mut Vec<PendingGossipPublish>,
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
@@ -287,15 +319,46 @@ fn handle_command(
         }
         EngineCommand::PublishPublic { topic, data, reply } => {
             let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
-            let result = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(gossipsub_topic, data)
-                .map(|msg_id| {
+            let topic_hash = gossipsub_topic.hash();
+            match swarm.behaviour_mut().gossipsub.publish(gossipsub_topic, data.clone()) {
+                Ok(msg_id) => {
                     info!(%topic, %msg_id, "published public message");
-                })
-                .map_err(|e| format!("gossipsub publish failed: {e}"));
-            let _ = reply.send(result);
+                    // Check if any peers are in the mesh for this topic.
+                    let mesh_count = swarm
+                        .behaviour()
+                        .gossipsub
+                        .mesh_peers(&topic_hash)
+                        .count();
+                    if mesh_count > 0 {
+                        info!(%topic, mesh_count, "gossipsub mesh has peers");
+                        let _ = reply.send(Ok(()));
+                    } else {
+                        // Defer the reply — wait up to GOSSIP_PUBLISH_TIMEOUT for peers.
+                        let deadline =
+                            tokio::time::Instant::now() + GOSSIP_PUBLISH_TIMEOUT;
+                        info!(%topic, "no mesh peers yet, waiting up to {}s", GOSSIP_PUBLISH_TIMEOUT.as_secs());
+                        pending_publishes.push(PendingGossipPublish {
+                            reply,
+                            deadline,
+                            topic: topic.clone(),
+                        });
+                    }
+                }
+                Err(gossipsub::PublishError::InsufficientPeers) => {
+                    // No mesh peers at all — defer and wait for peers to join.
+                    let deadline =
+                        tokio::time::Instant::now() + GOSSIP_PUBLISH_TIMEOUT;
+                    info!(%topic, "no mesh peers, deferring publish for up to {}s", GOSSIP_PUBLISH_TIMEOUT.as_secs());
+                    pending_publishes.push(PendingGossipPublish {
+                        reply,
+                        deadline,
+                        topic: topic.clone(),
+                    });
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("gossipsub publish failed: {e}")));
+                }
+            }
             None
         }
         EngineCommand::Dial { addr } => {
@@ -386,7 +449,7 @@ fn handle_command(
             tags,
             reply,
         } => {
-            let result = (|| -> Result<String, String> {
+            let result = (|| -> Result<(String, Option<String>), String> {
                 let kp = keypair.ok_or("no keypair configured")?;
 
                 // Parse recipient public key from base64.
@@ -430,6 +493,35 @@ fn handle_command(
                 let encoded = msg_codec::encode(&envelope, kp)
                     .map_err(|e| format!("codec encode failed: {e}"))?;
 
+                // Always store a copy in the local Sent folder.
+                if let Some(st) = store {
+                    let sent_msg = Message {
+                        id: envelope.id,
+                        swarm_id: "dm".to_string(),
+                        folder_path: "Sent".to_string(),
+                        sender_pubkey: kp.verifying_key().to_bytes(),
+                        sender: b64.encode(kp.verifying_key().to_bytes()),
+                        recipient: peer_id.to_string(),
+                        subject: String::new(),
+                        body: body.clone(),
+                        tags: tags.join(" "),
+                        created_at: envelope.timestamp,
+                        read: true,
+                    };
+                    if let Err(e) = st.insert_message(&sent_msg) {
+                        warn!(%e, "failed to store sent message locally");
+                    } else {
+                        info!(%message_id, "message stored in Sent folder");
+                    }
+                    // Upsert plaintext tags into normalised tag table.
+                    if !tags.is_empty() {
+                        let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+                        if let Err(e) = st.upsert_tags(&envelope.id, &tag_refs) {
+                            warn!(%e, "failed to upsert sent message tags");
+                        }
+                    }
+                }
+
                 // Dispatch via request-response.
                 let request = MailRequest {
                     envelope_data: encoded,
@@ -440,8 +532,17 @@ fn handle_command(
                     .send_request(&peer_id, request);
                 *in_flight += 1;
 
+                // Check peer connectivity and warn if isolated.
+                let warning = if peers.is_empty() {
+                    let msg = "no peers connected \u{2014} message stored locally; will not propagate until daemon is running".to_string();
+                    warn!("{}", msg);
+                    Some(msg)
+                } else {
+                    None
+                };
+
                 info!(%peer_id, %message_id, "private message sent via request-response");
-                Ok(message_id)
+                Ok((message_id, warning))
             })();
             let _ = reply.send(result);
             None
@@ -602,6 +703,46 @@ fn dial_learned_peers(swarm: &mut Swarm<SlashmailBehaviour>, peers: &[peer_excha
             }
         } else {
             debug!("skipping malformed peer info in exchange");
+        }
+    }
+}
+
+/// Resolve pending gossipsub publishes that have gained mesh peers or timed out.
+///
+/// When `timeout_fired` is true, all pending entries are resolved (used both
+/// when the select timer fires and at shutdown). Otherwise, entries are resolved
+/// only if their topic now has mesh peers.
+fn resolve_pending_publishes(
+    swarm: &mut Swarm<SlashmailBehaviour>,
+    pending: &mut Vec<PendingGossipPublish>,
+    timeout_fired: bool,
+) {
+    let mut i = 0;
+    while i < pending.len() {
+        let topic_hash = libp2p::gossipsub::Sha256Topic::new(&pending[i].topic).hash();
+        let mesh_count = swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic_hash)
+            .count();
+
+        let should_resolve = mesh_count > 0 || timeout_fired;
+        if should_resolve {
+            let entry = pending.swap_remove(i);
+            if mesh_count > 0 {
+                info!(topic = %entry.topic, mesh_count, "gossipsub publish confirmed — mesh peers found");
+                let _ = entry.reply.send(Ok(()));
+            } else {
+                warn!(
+                    topic = %entry.topic,
+                    "no peers connected \u{2014} message stored locally; will not propagate until daemon is running"
+                );
+                // Still return Ok — the message was published locally, just no peers to propagate.
+                let _ = entry.reply.send(Ok(()));
+            }
+            // Don't increment i — swap_remove moved the last element here.
+        } else {
+            i += 1;
         }
     }
 }
@@ -1647,7 +1788,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_public_without_subscription_fails() {
+    async fn publish_public_without_subscription_resolves_at_shutdown() {
+        // With no subscription and no peers, gossipsub returns InsufficientPeers.
+        // The engine now defers the reply and resolves it Ok at shutdown
+        // (message is stored locally; no propagation).
         let (swarm, tx, rx) = setup().await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1663,9 +1807,9 @@ mod tests {
         let reason = run_loop(swarm, rx, None, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
 
-        // Publishing without subscribing first should fail (no peers in mesh).
+        // Reply is resolved Ok at shutdown — local storage, no propagation.
         let result = reply_rx.await.unwrap();
-        assert!(result.is_err(), "publish should fail without subscription");
+        assert!(result.is_ok(), "publish should resolve Ok at shutdown: {:?}", result);
     }
 
     #[tokio::test]
@@ -1871,7 +2015,7 @@ mod tests {
         // The reply should contain a valid message UUID.
         let result = reply_rx.await.unwrap();
         assert!(result.is_ok(), "SendMessage should succeed: {:?}", result);
-        let msg_id = result.unwrap();
+        let (msg_id, _warning) = result.unwrap();
         // UUID format: 8-4-4-4-12
         assert_eq!(msg_id.len(), 36);
         assert!(msg_id.contains('-'));
@@ -1974,5 +2118,172 @@ mod tests {
 
         let stored_tags = store.get_message_tags(&envelope.id).unwrap();
         assert_eq!(stored_tags, vec!["important", "private"]);
+    }
+
+    // ---- SendMessage local Sent folder tests ----
+
+    #[tokio::test]
+    async fn send_message_stores_in_sent_folder() {
+        let sender_identity = Identity::generate();
+        let sender_kp = sender_identity.keypair().clone();
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        let (swarm, tx, rx) = setup().await;
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "test sent folder".into(),
+            tags: vec!["work".into()],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, Some(store), None, Some(&sender_kp)).await;
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_ok(), "SendMessage should succeed: {:?}", result);
+
+        // Re-open the store to verify persistence.
+        let store2 = MessageStore::open(&db_path).unwrap();
+        let all = store2.list_messages(0).unwrap();
+        assert_eq!(all.len(), 1, "should have one message in store");
+        assert_eq!(all[0].folder_path, "Sent");
+        assert_eq!(all[0].body, "test sent folder");
+        assert_eq!(all[0].tags, "work");
+        assert!(all[0].read, "sent messages should be marked as read");
+    }
+
+    #[tokio::test]
+    async fn send_message_warns_when_no_peers() {
+        let sender_identity = Identity::generate();
+        let sender_kp = sender_identity.keypair().clone();
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let (swarm, tx, rx) = setup().await;
+        let store = MessageStore::open_memory().unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "lonely message".into(),
+            tags: vec![],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, Some(store), None, Some(&sender_kp)).await;
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_ok());
+        let (_msg_id, warning) = result.unwrap();
+        assert!(warning.is_some(), "should warn when no peers connected");
+        assert!(warning.unwrap().contains("no peers connected"));
+    }
+
+    #[tokio::test]
+    async fn send_message_stores_multiple_tags_in_sent() {
+        let sender_identity = Identity::generate();
+        let sender_kp = sender_identity.keypair().clone();
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        let (swarm, tx, rx) = setup().await;
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "multi-tag".into(),
+            tags: vec!["urgent".into(), "private".into()],
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, Some(store), None, Some(&sender_kp)).await;
+
+        let result = reply_rx.await.unwrap();
+        let (msg_id, _) = result.unwrap();
+
+        // Re-open the store to verify.
+        let store2 = MessageStore::open(&db_path).unwrap();
+        let all = store2.list_messages(0).unwrap();
+        assert_eq!(all.len(), 1);
+        // Tags text preserves insertion order.
+        assert!(all[0].tags.contains("urgent"));
+        assert!(all[0].tags.contains("private"));
+
+        // Verify normalised tags were upserted.
+        let msg_uuid = uuid::Uuid::parse_str(&msg_id).unwrap();
+        let tags = store2.get_message_tags(&msg_uuid).unwrap();
+        assert_eq!(tags, vec!["private", "urgent"]); // alphabetical from DB
+    }
+
+    // ---- Gossipsub publish timeout tests ----
+
+    #[tokio::test]
+    async fn publish_public_defers_reply_when_no_mesh_peers() {
+        // With no connected peers, PublishPublic should defer the reply until
+        // the timeout fires, then return Ok (the message is stored locally).
+        let (swarm, tx, rx) = setup().await;
+
+        tx.send(EngineCommand::Subscribe {
+            topic: "pub_test_timeout".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::PublishPublic {
+            topic: "pub_test_timeout".into(),
+            data: b"hello deferred".to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+
+        // Schedule shutdown after a brief delay so the timeout fires.
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            // The GOSSIP_PUBLISH_TIMEOUT is 10s but the test swarm has no peers,
+            // so the deadline will fire. We send Shutdown shortly after to end the loop.
+            // The pending publish will be resolved when the timeout fires.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tx2.send(EngineCommand::Shutdown).await;
+        });
+
+        let reason = run_loop(swarm, rx, None, None, None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        // The reply should eventually be resolved (Ok with local-only storage).
+        match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(result)) => {
+                // Should be Ok — message was published locally.
+                assert!(result.is_ok(), "deferred publish should succeed: {:?}", result);
+            }
+            Ok(Err(_)) => {
+                // Sender was dropped — this is also acceptable since shutdown
+                // might have occurred before the pending was resolved.
+            }
+            Err(_) => panic!("reply_rx timed out waiting for deferred publish"),
+        }
     }
 }
