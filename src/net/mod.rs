@@ -1,7 +1,6 @@
 //! Networking layer: libp2p transport, behaviour, and swarm construction.
 
 pub mod behaviour;
-pub mod transport;
 
 use crate::error::AppError;
 use crate::identity::Identity;
@@ -113,9 +112,7 @@ mod tests {
     #[tokio::test]
     async fn build_swarm_starts() {
         let identity = Identity::generate();
-        let result = build_swarm(&identity).await;
-        assert!(result.is_ok(), "swarm should build successfully");
-        let (swarm, peer_id) = result.unwrap();
+        let (swarm, peer_id) = build_swarm(&identity).await.expect("swarm should build successfully");
         assert_eq!(*swarm.local_peer_id(), peer_id);
     }
 
