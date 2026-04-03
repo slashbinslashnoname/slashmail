@@ -394,6 +394,13 @@ fn handle_command(
             let result = match swarm.dial(addr.clone()) {
                 Ok(()) => {
                     info!(%addr, "peer added and dialing");
+                    // Persist to bootstrap_peers in config so we reconnect on restart.
+                    let addr_str = addr.to_string();
+                    match crate::storage::config::Config::add_bootstrap_peer(&addr_str) {
+                        Ok(true) => info!(%addr_str, "saved to bootstrap_peers"),
+                        Ok(false) => debug!(%addr_str, "already in bootstrap_peers"),
+                        Err(e) => warn!(%addr_str, %e, "failed to save bootstrap peer to config"),
+                    }
                     Ok(())
                 }
                 Err(e) => {

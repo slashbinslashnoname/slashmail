@@ -59,6 +59,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_addr: Option<String>,
 
+    /// Persistent bootstrap peers to auto-dial on daemon start.
+    ///
+    /// Each entry is a multiaddr string (e.g. `/ip4/1.2.3.4/tcp/4001`).
+    /// Peers added via `add-peer` are automatically appended here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_peers: Vec<String>,
+
     /// Known swarms, keyed by swarm ID.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub swarms: HashMap<String, SwarmEntry>,
@@ -80,6 +87,7 @@ impl Default for Config {
             listen_addr: default_listen_addr(),
             mdns_enabled: true,
             relay_addr: None,
+            bootstrap_peers: Vec::new(),
             swarms: HashMap::new(),
         }
     }
@@ -148,6 +156,18 @@ impl Config {
         self.save_to(&path)
     }
 
+    /// Add a multiaddr to the bootstrap peers list if not already present,
+    /// then persist the config. Returns `true` if the peer was newly added.
+    pub fn add_bootstrap_peer(addr: &str) -> Result<bool, AppError> {
+        let mut cfg = Self::load()?;
+        if cfg.bootstrap_peers.iter().any(|a| a == addr) {
+            return Ok(false);
+        }
+        cfg.bootstrap_peers.push(addr.to_string());
+        cfg.save()?;
+        Ok(true)
+    }
+
     /// Save configuration to an arbitrary path.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
         if let Some(parent) = path.parent() {
@@ -177,6 +197,7 @@ mod tests {
         assert_eq!(cfg.listen_addr, "/ip4/0.0.0.0/tcp/0");
         assert!(cfg.mdns_enabled);
         assert_eq!(cfg.relay_addr, None);
+        assert!(cfg.bootstrap_peers.is_empty());
         assert!(cfg.swarms.is_empty());
     }
 
@@ -209,6 +230,10 @@ mod tests {
             listen_addr: "/ip4/127.0.0.1/tcp/4001".to_string(),
             mdns_enabled: false,
             relay_addr: None,
+            bootstrap_peers: vec![
+                "/ip4/1.2.3.4/tcp/4001".to_string(),
+                "/ip4/5.6.7.8/tcp/9000".to_string(),
+            ],
             swarms,
         };
 
@@ -450,5 +475,66 @@ relay_addr = "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JE
             cfg.relay_addr.as_deref(),
             Some("/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN")
         );
+    }
+
+    #[test]
+    fn bootstrap_peers_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let cfg = Config {
+            bootstrap_peers: vec![
+                "/ip4/1.2.3.4/tcp/4001".to_string(),
+                "/ip4/5.6.7.8/udp/9000/quic-v1".to_string(),
+            ],
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.bootstrap_peers, cfg.bootstrap_peers);
+    }
+
+    #[test]
+    fn empty_bootstrap_peers_not_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        Config::default().save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("bootstrap_peers"),
+            "empty bootstrap_peers should be omitted from TOML"
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_bootstrap_peers_defaults_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "display_name = \"OldNode\"\n").unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.bootstrap_peers.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_peers_from_raw_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+bootstrap_peers = [
+    "/ip4/1.2.3.4/tcp/4001",
+    "/ip4/10.0.0.1/tcp/5000",
+]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.bootstrap_peers.len(), 2);
+        assert_eq!(cfg.bootstrap_peers[0], "/ip4/1.2.3.4/tcp/4001");
+        assert_eq!(cfg.bootstrap_peers[1], "/ip4/10.0.0.1/tcp/5000");
     }
 }

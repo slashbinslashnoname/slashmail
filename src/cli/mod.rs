@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
+use tracing::{info, warn};
+
 use crate::ctl::{self, CtlRequest, CtlResponse};
 use crate::error::AppError;
 use crate::storage::config::Config;
@@ -697,6 +699,17 @@ async fn run_daemon_start(listen: String) -> Result<()> {
     swarm
         .listen_on(listen_addr)
         .map_err(|e| AppError::Network(format!("failed to listen: {e}")))?;
+
+    // Auto-dial persistent bootstrap peers from config.
+    for addr_str in &config.bootstrap_peers {
+        match addr_str.parse::<Multiaddr>() {
+            Ok(addr) => match swarm.dial(addr) {
+                Ok(()) => info!(addr = %addr_str, "dialing bootstrap peer"),
+                Err(e) => warn!(addr = %addr_str, %e, "failed to dial bootstrap peer"),
+            },
+            Err(e) => warn!(addr = %addr_str, %e, "invalid bootstrap peer multiaddr, skipping"),
+        }
+    }
 
     // When relay_addr is configured, listen through the relay so that
     // dcutr can hole-punch connections for NATed peers.
