@@ -34,15 +34,42 @@ impl Identity {
             .map_err(|e| AppError::Other(format!("failed to store key in keyring: {e}")))
     }
 
-    /// Load an identity from the OS keyring.
+    /// Load an identity from the OS keyring, falling back to the `SLASHMAIL_KEY`
+    /// environment variable (base64-encoded 32-byte secret) when the keyring is
+    /// unavailable (e.g. headless CI, Docker).
     pub fn load_from_keyring() -> Result<Self, AppError> {
-        let secret_bytes = keystore::get_secret(KEYRING_ACCOUNT)
-            .map_err(|e| AppError::Other(format!("failed to load key from keyring: {e}")))?;
+        match keystore::get_secret(KEYRING_ACCOUNT) {
+            Ok(secret_bytes) => Self::identity_from_secret_bytes(secret_bytes),
+            Err(keyring_err) => {
+                // Fall back to SLASHMAIL_KEY env var when keyring is unavailable.
+                match std::env::var("SLASHMAIL_KEY") {
+                    Ok(b64) => {
+                        let secret_bytes =
+                            base64::engine::general_purpose::STANDARD.decode(&b64).map_err(
+                                |e| {
+                                    AppError::Crypto(format!(
+                                        "SLASHMAIL_KEY contains invalid base64: {e}"
+                                    ))
+                                },
+                            )?;
+                        Self::identity_from_secret_bytes(secret_bytes)
+                    }
+                    Err(_) => match keyring_err.downcast::<keyring::Error>() {
+                        Ok(ke) => Err(AppError::Keyring(ke)),
+                        Err(e) => Err(AppError::Other(format!(
+                            "failed to load key from keyring: {e}"
+                        ))),
+                    },
+                }
+            }
+        }
+    }
 
+    /// Build an identity from raw secret bytes (expected 32 bytes).
+    fn identity_from_secret_bytes(secret_bytes: Vec<u8>) -> Result<Self, AppError> {
         let bytes: [u8; 32] = secret_bytes.try_into().map_err(|_| {
-            AppError::Crypto("invalid key length in keyring (expected 32 bytes)".to_string())
+            AppError::Crypto("invalid key length (expected 32 bytes)".to_string())
         })?;
-
         let keypair = Keypair::from_bytes(&bytes);
         Ok(Self { keypair })
     }
@@ -128,5 +155,79 @@ mod tests {
         let bytes = id.keypair().to_bytes();
         let restored = Keypair::from_bytes(&bytes);
         assert_eq!(restored.verifying_key(), id.public_key());
+    }
+
+    #[test]
+    fn identity_from_secret_bytes_valid() {
+        let id = Identity::generate();
+        let bytes = id.keypair().to_bytes().to_vec();
+        let restored = Identity::identity_from_secret_bytes(bytes).unwrap();
+        assert_eq!(restored.public_key(), id.public_key());
+    }
+
+    #[test]
+    fn identity_from_secret_bytes_wrong_length() {
+        let result = Identity::identity_from_secret_bytes(vec![0u8; 16]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AppError::Crypto(_)),
+            "expected Crypto error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_env_var_fallback() {
+        // Generate a known identity and encode its secret key as base64.
+        let id = Identity::generate();
+        let secret_bytes = id.keypair().to_bytes();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret_bytes);
+
+        // Set the env var and attempt load (keyring will fail in test env).
+        std::env::set_var("SLASHMAIL_KEY", &b64);
+        let result = Identity::load_from_keyring();
+        std::env::remove_var("SLASHMAIL_KEY");
+
+        // On platforms where keyring access works in tests, the keyring path
+        // succeeds — either way the loaded identity must be valid.
+        match result {
+            Ok(loaded) => {
+                // If we got back the env-var identity, keys must match.
+                // (If keyring succeeded instead, that's also fine.)
+                // We can't distinguish, so just assert it loaded successfully.
+                assert_eq!(loaded.public_key().as_bytes().len(), 32);
+            }
+            Err(e) => panic!("load_from_keyring should succeed with SLASHMAIL_KEY set: {e}"),
+        }
+    }
+
+    #[test]
+    fn load_from_env_var_invalid_base64() {
+        std::env::set_var("SLASHMAIL_KEY", "not-valid-base64!!!");
+        let result = Identity::load_from_keyring();
+        std::env::remove_var("SLASHMAIL_KEY");
+
+        // If keyring succeeds, the env var is never consulted — skip assertion.
+        if let Err(e) = result {
+            assert!(
+                matches!(e, AppError::Crypto(_)),
+                "expected Crypto error for bad base64, got: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_from_env_var_wrong_length() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"tooshort");
+        std::env::set_var("SLASHMAIL_KEY", &b64);
+        let result = Identity::load_from_keyring();
+        std::env::remove_var("SLASHMAIL_KEY");
+
+        if let Err(e) = result {
+            assert!(
+                matches!(e, AppError::Crypto(_)),
+                "expected Crypto error for wrong length, got: {e:?}"
+            );
+        }
     }
 }

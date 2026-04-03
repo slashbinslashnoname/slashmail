@@ -69,7 +69,10 @@ impl AppError {
                 vec![format!("Check TOML syntax in {}", path.display())]
             }
             AppError::Keyring(_) => {
-                vec!["Run `slashmail init` to create an identity".into()]
+                vec![
+                    "Run `slashmail init` to create an identity".into(),
+                    "In headless environments (CI, Docker), set SLASHMAIL_KEY env var (base64-encoded 32-byte secret key)".into(),
+                ]
             }
             AppError::NotFound(_) => {
                 vec!["Check the identifier and try again".into()]
@@ -85,5 +88,24 @@ impl AppError {
             }
             _ => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyring_error_suggests_env_var() {
+        let err = AppError::Keyring(keyring::Error::NoEntry);
+        let suggestions = err.suggestions();
+        assert!(
+            suggestions.iter().any(|s| s.contains("SLASHMAIL_KEY")),
+            "keyring error should suggest SLASHMAIL_KEY env var, got: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|s| s.contains("slashmail init")),
+            "keyring error should suggest slashmail init, got: {suggestions:?}"
+        );
     }
 }
