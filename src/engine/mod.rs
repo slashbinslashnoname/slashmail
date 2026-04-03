@@ -1,5 +1,7 @@
 //! Engine: central event loop multiplexing swarm events, CLI commands, and OS signals.
 
+pub mod topic_registry;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -25,6 +27,8 @@ use crate::net::peer_exchange::{
 };
 use crate::net::rr::{MailRequest, MailResponse};
 use crate::storage::db::{Message, MessageStore};
+
+pub use topic_registry::TopicRegistry;
 
 /// Duration to wait for in-flight requests to drain during shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,6 +103,10 @@ pub enum EngineCommand {
     GetPeers {
         reply: tokio::sync::oneshot::Sender<Vec<PeerInfo>>,
     },
+    /// Query active gossipsub topic subscriptions.
+    GetSubscriptions {
+        reply: tokio::sync::oneshot::Sender<HashMap<String, String>>,
+    },
     /// Request a graceful shutdown.
     Shutdown,
 }
@@ -140,6 +148,7 @@ pub async fn run_loop(
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     let mut in_flight: usize = 0;
     let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
+    let mut topic_registry = TopicRegistry::new();
 
     info!("engine event loop started");
 
@@ -159,7 +168,7 @@ pub async fn run_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(command) => {
-                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers) {
+                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers, &mut topic_registry) {
                             break reason;
                         }
                     }
@@ -172,14 +181,14 @@ pub async fn run_loop(
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref());
+                let action = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry);
                 apply_swarm_action(&mut swarm, action);
             }
         }
     };
 
     // --- Graceful shutdown sequence ---
-    drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref()).await;
+    drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref(), &topic_registry).await;
 
     if let Some(flush) = wal_flush {
         info!("flushing SQLite WAL checkpoint");
@@ -198,6 +207,7 @@ async fn drain_in_flight(
     peers: &mut HashMap<PeerId, PeerState>,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
+    topic_registry: &TopicRegistry,
 ) {
     if *in_flight == 0 {
         debug!("no in-flight requests to drain");
@@ -218,7 +228,7 @@ async fn drain_in_flight(
                 break;
             }
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, in_flight, peers, keypair, store);
+                let action = handle_swarm_event(event, in_flight, peers, keypair, store, topic_registry);
                 apply_swarm_action(swarm, action);
                 if *in_flight == 0 {
                     info!("all in-flight requests drained");
@@ -235,12 +245,16 @@ fn handle_command(
     command: EngineCommand,
     store: Option<&MessageStore>,
     peers: &HashMap<PeerId, PeerState>,
+    topic_registry: &mut TopicRegistry,
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
             let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
             match swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic) {
-                Ok(true) => info!(%topic, "subscribed to topic"),
+                Ok(true) => {
+                    topic_registry.subscribe(&topic);
+                    info!(%topic, "subscribed to topic");
+                }
                 Ok(false) => debug!(%topic, "already subscribed to topic"),
                 Err(e) => warn!(%topic, %e, "failed to subscribe to topic"),
             }
@@ -249,7 +263,10 @@ fn handle_command(
         EngineCommand::Unsubscribe { topic } => {
             let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
             match swarm.behaviour_mut().gossipsub.unsubscribe(&gossipsub_topic) {
-                Ok(true) => info!(%topic, "unsubscribed from topic"),
+                Ok(true) => {
+                    topic_registry.unsubscribe(&topic);
+                    info!(%topic, "unsubscribed from topic");
+                }
                 Ok(false) => debug!(%topic, "was not subscribed to topic"),
                 Err(e) => warn!(%topic, %e, "failed to unsubscribe from topic"),
             }
@@ -339,6 +356,15 @@ fn handle_command(
                 })
                 .collect();
             let _ = reply.send(peer_list);
+            None
+        }
+        EngineCommand::GetSubscriptions { reply } => {
+            let subs: HashMap<String, String> = topic_registry
+                .subscriptions()
+                .iter()
+                .map(|(hash, name)| (hash.to_string(), name.clone()))
+                .collect();
+            let _ = reply.send(subs);
             None
         }
         EngineCommand::Shutdown => {
@@ -505,6 +531,7 @@ fn handle_swarm_event(
     peers: &mut HashMap<PeerId, PeerState>,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
+    topic_registry: &TopicRegistry,
 ) -> SwarmAction {
     match event {
         // --- Request-response events (tracked for graceful drain) ---
@@ -514,7 +541,7 @@ fn handle_swarm_event(
 
         // --- Gossipsub events ---
         SwarmEvent::Behaviour(SlashmailBehaviourEvent::Gossipsub(gs_event)) => {
-            handle_gossipsub_event(gs_event, keypair, store);
+            handle_gossipsub_event(gs_event, keypair, store, topic_registry);
             SwarmAction::None
         }
 
@@ -723,10 +750,14 @@ fn handle_rr_event(
 }
 
 /// Handle gossipsub events, storing public messages when keypair/store are available.
+///
+/// The `topic_registry` is used to resolve the gossipsub `TopicHash` back to
+/// the human-readable swarm name for logging and future message routing.
 fn handle_gossipsub_event(
     event: gossipsub::Event,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
+    topic_registry: &TopicRegistry,
 ) {
     match event {
         gossipsub::Event::Message {
@@ -734,7 +765,13 @@ fn handle_gossipsub_event(
             message_id,
             message,
         } => {
-            debug!(%propagation_source, %message_id, "gossipsub message received");
+            let swarm_name = topic_registry.resolve(&message.topic);
+            debug!(
+                %propagation_source, %message_id,
+                topic = %message.topic,
+                swarm = swarm_name.unwrap_or("<unknown>"),
+                "gossipsub message received"
+            );
             if let (Some(kp), Some(st)) = (keypair, store) {
                 match process_inbound_envelope(&message.data, kp, st) {
                     Ok(()) => {
@@ -747,10 +784,12 @@ fn handle_gossipsub_event(
             }
         }
         gossipsub::Event::Subscribed { peer_id, topic } => {
-            debug!(%peer_id, %topic, "peer subscribed");
+            let swarm_name = topic_registry.resolve(&topic);
+            debug!(%peer_id, %topic, swarm = swarm_name.unwrap_or("<unknown>"), "peer subscribed");
         }
         gossipsub::Event::Unsubscribed { peer_id, topic } => {
-            debug!(%peer_id, %topic, "peer unsubscribed");
+            let swarm_name = topic_registry.resolve(&topic);
+            debug!(%peer_id, %topic, swarm = swarm_name.unwrap_or("<unknown>"), "peer unsubscribed");
         }
         gossipsub::Event::GossipsubNotSupported { peer_id } => {
             debug!(%peer_id, "gossipsub not supported by peer");
@@ -969,6 +1008,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_subscriptions_reflects_subscribe_unsubscribe() {
+        let (swarm, tx, rx) = setup().await;
+
+        tx.send(EngineCommand::Subscribe {
+            topic: "pub_general".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::GetSubscriptions { reply: reply_tx })
+            .await
+            .unwrap();
+
+        tx.send(EngineCommand::Unsubscribe {
+            topic: "pub_general".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::GetSubscriptions { reply: reply_tx2 })
+            .await
+            .unwrap();
+
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, None, None, None).await;
+
+        let subs = reply_rx.await.unwrap();
+        assert_eq!(subs.values().filter(|v| v.as_str() == "pub_general").count(), 1);
+
+        let subs_after = reply_rx2.await.unwrap();
+        assert!(!subs_after.values().any(|v| v == "pub_general"));
+    }
+
+    #[tokio::test]
     async fn listen_then_shutdown() {
         let (swarm, tx, rx) = setup().await;
 
@@ -1074,9 +1150,10 @@ mod tests {
         let (mut swarm, _tx, _rx) = setup().await;
         let mut in_flight: usize = 0;
         let mut peers = HashMap::new();
+        let topic_registry = TopicRegistry::new();
 
         let start = tokio::time::Instant::now();
-        drain_in_flight(&mut swarm, &mut in_flight, &mut peers, None, None).await;
+        drain_in_flight(&mut swarm, &mut in_flight, &mut peers, None, None, &topic_registry).await;
         let elapsed = start.elapsed();
 
         assert!(
