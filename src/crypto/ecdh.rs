@@ -259,27 +259,27 @@ mod tests {
         );
     }
 
-    /// Runtime check: SharedSecret memory is zeroed after drop.
+    /// Runtime check: SharedSecret memory is zeroed by `zeroize()`.
     ///
-    /// We allocate on the heap via Box, capture the pointer, drop the value,
-    /// then verify the backing memory has been overwritten to all zeros.
+    /// Calls `zeroize()` explicitly on a live value and verifies the buffer
+    /// is all zeros. `ZeroizeOnDrop` invokes the same `zeroize()` method in
+    /// its `Drop` impl, so this validates on-drop behavior without reading
+    /// deallocated memory (which is UB and inherently racy).
     #[test]
     fn zeroize_shared_secret_overwrites_buffer() {
+        use zeroize::Zeroize;
+
         let alice = generate_keypair();
         let bob = generate_keypair();
-        let secret = Box::new(derive_shared_secret(&alice, &bob.verifying_key()));
-        // Verify it's non-zero before drop
+        let mut secret = derive_shared_secret(&alice, &bob.verifying_key());
+        // Verify it's non-zero before zeroize
         let non_zero = secret.as_bytes().iter().any(|&b| b != 0);
         assert!(non_zero, "shared secret should be non-zero");
-        let ptr = secret.as_bytes().as_ptr();
-        drop(secret);
-        // SAFETY: We just dropped the Box; the allocator hasn't reused this memory yet.
-        // We read 32 bytes that were formerly the SharedSecret inner buffer.
-        let after_drop: [u8; 32] = unsafe { std::ptr::read(ptr as *const [u8; 32]) };
+        secret.zeroize();
         assert_eq!(
-            after_drop,
-            [0u8; 32],
-            "SharedSecret buffer was not zeroed on drop"
+            secret.as_bytes(),
+            &[0u8; 32],
+            "SharedSecret buffer was not zeroed after zeroize()"
         );
     }
 }
