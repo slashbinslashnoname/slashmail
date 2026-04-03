@@ -7,11 +7,18 @@ use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
     swarm::NetworkBehaviour, PeerId,
 };
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use thiserror::Error;
 
 use super::peer_exchange::{self, PeerExchangeCodec};
 use super::rr::{self, MailCodec};
+
+/// Maximum gossipsub message size (256 KiB).
+///
+/// Must be large enough for a compressed [`Envelope`] but bounded to prevent
+/// memory exhaustion from oversized messages.
+const MAX_GOSSIPSUB_MESSAGE_SIZE: usize = 256 * 1024;
 
 /// Combined libp2p behaviour for slashmail.
 #[derive(NetworkBehaviour)]
@@ -41,10 +48,32 @@ impl SlashmailBehaviour {
     pub fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Result<Self, BehaviourError> {
         let peer_id = PeerId::from(key.public());
 
-        // Gossipsub with message signing and deduplication.
+        // Gossipsub with message signing, content-based deduplication, and tuned mesh.
+        //
+        // Topic hashing: callers use `gossipsub::Sha256Topic` so topic strings are
+        // never leaked on the wire — peers see only the SHA-256 hash.
+        //
+        // Message ID: derived from SHA-256(data) to deduplicate by content rather
+        // than by (source, seqno), which avoids re-processing identical envelopes
+        // relayed through different paths.
+        //
+        // Mesh parameters are tuned for a small-to-medium overlay:
+        //   mesh_n = 4       target mesh peers per topic
+        //   mesh_n_low = 2   minimum before grafting
+        //   mesh_n_high = 8  maximum before pruning
+        //   gossip_lazy = 3  peers receiving IHAVE gossip each heartbeat
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(1))
             .validation_mode(gossipsub::ValidationMode::Strict)
+            .mesh_n(4)
+            .mesh_n_low(2)
+            .mesh_n_high(8)
+            .gossip_lazy(3)
+            .max_transmit_size(MAX_GOSSIPSUB_MESSAGE_SIZE)
+            .message_id_fn(|msg: &gossipsub::Message| {
+                let hash = Sha256::digest(&msg.data);
+                gossipsub::MessageId::from(hash.to_vec())
+            })
             .build()
             .map_err(|e| BehaviourError(format!("gossipsub config: {e}")))?;
 
@@ -125,7 +154,7 @@ mod tests {
     fn behaviour_gossipsub_subscribe_then_unsubscribe() {
         let key = Keypair::generate_ed25519();
         let mut behaviour = make_behaviour(&key);
-        let topic = gossipsub::IdentTopic::new("another-topic");
+        let topic = gossipsub::Sha256Topic::new("pub_general");
         assert!(behaviour.gossipsub.subscribe(&topic).is_ok());
         assert!(behaviour.gossipsub.unsubscribe(&topic).is_ok());
     }
@@ -134,9 +163,28 @@ mod tests {
     fn behaviour_gossipsub_accepts_subscription() {
         let key = Keypair::generate_ed25519();
         let mut behaviour = make_behaviour(&key);
-        let topic = gossipsub::IdentTopic::new("test-topic");
+        let topic = gossipsub::Sha256Topic::new("pub_general");
         let result = behaviour.gossipsub.subscribe(&topic);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn behaviour_gossipsub_sha256_topic_hides_plaintext() {
+        // Sha256Topic hashes the topic string so the raw name is never on the wire.
+        let topic = gossipsub::Sha256Topic::new("pub_secret_room");
+        let hash = topic.hash();
+        assert_ne!(hash.as_str(), "pub_secret_room");
+        // The hash string must not contain the plaintext topic.
+        assert!(!hash.as_str().contains("pub_secret_room"));
+    }
+
+    #[test]
+    fn behaviour_gossipsub_duplicate_subscribe_returns_false() {
+        let key = Keypair::generate_ed25519();
+        let mut behaviour = make_behaviour(&key);
+        let topic = gossipsub::Sha256Topic::new("pub_dup");
+        assert_eq!(behaviour.gossipsub.subscribe(&topic).unwrap(), true);
+        assert_eq!(behaviour.gossipsub.subscribe(&topic).unwrap(), false);
     }
 
     #[test]
