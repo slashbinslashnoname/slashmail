@@ -2,7 +2,10 @@
 //! and request-response for direct mail delivery.
 
 use libp2p::identity::Keypair;
-use libp2p::{gossipsub, identify, kad, mdns, request_response, swarm::NetworkBehaviour, PeerId};
+use libp2p::{
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response,
+    swarm::NetworkBehaviour, PeerId,
+};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -16,6 +19,9 @@ pub struct SlashmailBehaviour {
     pub identify: identify::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
+    pub relay_client: relay::client::Behaviour,
+    pub dcutr: dcutr::Behaviour,
+    pub autonat: autonat::Behaviour,
 }
 
 /// Error type for behaviour construction.
@@ -58,12 +64,31 @@ impl SlashmailBehaviour {
         // Request-response for direct private mail delivery.
         let mail_rr = rr::mail_behaviour();
 
+        // Relay client for circuit relay v2 (needed by dcutr for hole punching).
+        let (relay_transport, relay_client) =
+            relay::client::new(peer_id);
+
+        // DCUtR (Direct Connection Upgrade through Relay) for NAT hole punching.
+        let dcutr = dcutr::Behaviour::new(peer_id);
+
+        // AutoNAT for automatic NAT status detection.
+        let autonat = autonat::Behaviour::new(peer_id, Default::default());
+
+        // Note: `relay_transport` must be plumbed into the transport stack by the
+        // caller when constructing the swarm. We intentionally drop it here during
+        // behaviour construction; the swarm builder in `net::build_swarm` will
+        // obtain its own relay transport instance.
+        drop(relay_transport);
+
         Ok(Self {
             gossipsub,
             kademlia,
             identify,
             mdns,
             mail_rr,
+            relay_client,
+            dcutr,
+            autonat,
         })
     }
 }
@@ -95,5 +120,27 @@ mod tests {
         let topic = gossipsub::IdentTopic::new("test-topic");
         let result = behaviour.gossipsub.subscribe(&topic);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn behaviour_has_relay_client() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = SlashmailBehaviour::new(&key).unwrap();
+        // relay_client field exists and was constructed successfully
+        let _ = &behaviour.relay_client;
+    }
+
+    #[test]
+    fn behaviour_has_dcutr() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let _ = &behaviour.dcutr;
+    }
+
+    #[test]
+    fn behaviour_has_autonat() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let _ = &behaviour.autonat;
     }
 }
