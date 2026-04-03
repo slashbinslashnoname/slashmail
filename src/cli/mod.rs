@@ -3,6 +3,9 @@ mod init;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Parser)]
 #[command(name = "slashmail", about = "Peer-to-peer encrypted mail")]
 pub struct Args {
@@ -14,25 +17,36 @@ pub struct Args {
 pub enum Command {
     /// Initialize a new identity
     Init,
-    /// Send a message
+    /// Show identity and node status
+    Status,
+    /// Send a message to a peer
     Send {
         /// Recipient public key (base64)
         #[arg(short, long)]
         to: String,
-        /// Message body
-        #[arg(short, long)]
-        body: String,
+        /// Tags to attach to the message
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
     },
-    /// Read inbox
-    Inbox,
+    /// List messages, optionally filtered by tag
+    List {
+        /// Filter by tag
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
+    /// Search messages
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// List known peers
+    Peers,
     /// Start the P2P daemon
     Daemon {
         /// Listen address
         #[arg(short, long, default_value = "/ip4/0.0.0.0/tcp/0")]
         listen: String,
     },
-    /// Show own identity
-    Whoami,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -41,22 +55,29 @@ pub async fn run(args: Args) -> Result<()> {
             tracing::info!("initializing identity");
             init::run().await
         }
-        Command::Send { to, body } => {
-            tracing::info!(%to, "sending message");
-            let _ = body;
+        Command::Status => {
+            tracing::info!("showing status");
+            init::whoami().await
+        }
+        Command::Send { to, tags } => {
+            tracing::info!(%to, ?tags, "sending message");
             todo!("send command")
         }
-        Command::Inbox => {
-            tracing::info!("reading inbox");
-            todo!("inbox command")
+        Command::List { tag } => {
+            tracing::info!(?tag, "listing messages");
+            todo!("list command")
+        }
+        Command::Search { ref query } => {
+            tracing::info!(%query, "searching messages");
+            todo!("search command")
+        }
+        Command::Peers => {
+            tracing::info!("listing peers");
+            todo!("peers command")
         }
         Command::Daemon { listen } => {
             tracing::info!(%listen, "starting daemon");
             todo!("daemon command")
-        }
-        Command::Whoami => {
-            tracing::info!("showing identity");
-            init::whoami().await
         }
     }
 }
