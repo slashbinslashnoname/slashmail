@@ -874,4 +874,217 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].sender, "alice");
     }
+
+    // ── Additional storage tests (slashmail-hwt.2) ──────────────────────
+
+    #[test]
+    fn upsert_tags_idempotent_preserves_fts_consistency() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Tagged", "Body text");
+        store.insert_message(&m).unwrap();
+
+        // Apply same tags three times
+        for _ in 0..3 {
+            store.upsert_tags(&m.id, &["inbox", "priority"]).unwrap();
+        }
+
+        // Normalized tags are correct
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["inbox", "priority"]);
+
+        // Denormalized text is consistent
+        let all = store.list_messages(0).unwrap();
+        let words: Vec<&str> = all[0].tags.split_whitespace().collect();
+        assert_eq!(words.len(), 2);
+        assert!(words.contains(&"inbox"));
+        assert!(words.contains(&"priority"));
+
+        // FTS index still finds by each tag
+        assert_eq!(store.search_messages("tags:inbox").unwrap().len(), 1);
+        assert_eq!(store.search_messages("tags:priority").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_tags_idempotent_no_duplicate_rows() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Body");
+        store.insert_message(&m).unwrap();
+
+        store.upsert_tags(&m.id, &["a", "b"]).unwrap();
+        store.upsert_tags(&m.id, &["a", "b"]).unwrap();
+
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message_tags WHERE envelope_id = ?1",
+                params![m.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn messages_by_tag_returns_newest_first() {
+        let store = MessageStore::open_memory().unwrap();
+
+        let mut m1 = make_message("alice", "bob", "Old", "First");
+        m1.created_at = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut m2 = make_message("carol", "bob", "New", "Second");
+        m2.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+
+        store.tag_message(&m1.id, "work").unwrap();
+        store.tag_message(&m2.id, "work").unwrap();
+
+        let results = store.messages_by_tag("work").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].sender, "carol"); // newest first
+        assert_eq!(results[1].sender, "alice");
+    }
+
+    #[test]
+    fn messages_by_tag_preserves_all_fields() {
+        let store = MessageStore::open_memory().unwrap();
+
+        let mut m = make_message("alice", "bob", "Subject", "Body");
+        m.swarm_id = "my-swarm".to_string();
+        m.folder_path = "Archive".to_string();
+        m.sender_pubkey = [0xDD; 32];
+        m.read = true;
+
+        store.insert_message(&m).unwrap();
+        store.tag_message(&m.id, "test-tag").unwrap();
+
+        let results = store.messages_by_tag("test-tag").unwrap();
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.id, m.id);
+        assert_eq!(r.swarm_id, "my-swarm");
+        assert_eq!(r.folder_path, "Archive");
+        assert_eq!(r.sender_pubkey, [0xDD; 32]);
+        assert_eq!(r.sender, "alice");
+        assert_eq!(r.recipient, "bob");
+        assert_eq!(r.subject, "Subject");
+        assert_eq!(r.body, "Body");
+        assert!(r.read);
+    }
+
+    #[test]
+    fn fts5_search_returns_tags_in_results() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "searchterm_unique_789");
+        store.insert_message(&m).unwrap();
+
+        store
+            .upsert_tags(&m.id, &["important", "urgent"])
+            .unwrap();
+
+        // Search by body, verify tags column is populated in result
+        let results = store.search_messages("searchterm_unique_789").unwrap();
+        assert_eq!(results.len(), 1);
+        let tags_words: Vec<&str> = results[0].tags.split_whitespace().collect();
+        assert!(tags_words.contains(&"important"));
+        assert!(tags_words.contains(&"urgent"));
+    }
+
+    #[test]
+    fn fts5_search_by_tag_returns_tags_column() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        store
+            .upsert_tags(&m.id, &["confidential", "reviewed"])
+            .unwrap();
+
+        let results = store.search_messages("tags:confidential").unwrap();
+        assert_eq!(results.len(), 1);
+        let tags_words: Vec<&str> = results[0].tags.split_whitespace().collect();
+        assert!(tags_words.contains(&"confidential"));
+        assert!(tags_words.contains(&"reviewed"));
+    }
+
+    #[test]
+    fn migration_v1_from_empty_database() {
+        // Simulate opening a fresh database — verify v1 schema is applied
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        MessageStore::assert_fts5(&conn).unwrap();
+        let store = MessageStore { conn };
+        assert_eq!(store.schema_version().unwrap(), 0);
+
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 1);
+
+        // Verify tables exist and work
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+        store.upsert_tags(&m.id, &["inbox"]).unwrap();
+
+        let results = store.messages_by_tag("inbox").unwrap();
+        assert_eq!(results.len(), 1);
+
+        let fts = store.search_messages("tags:inbox").unwrap();
+        assert_eq!(fts.len(), 1);
+    }
+
+    #[test]
+    fn migration_v1_is_idempotent_with_existing_data() {
+        let store = MessageStore::open_memory().unwrap();
+
+        // Insert data
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+        store.upsert_tags(&m.id, &["inbox", "important"]).unwrap();
+
+        // Re-run migration — should not error or lose data
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 1);
+
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert_eq!(tags, vec!["important", "inbox"]);
+
+        let all = store.list_messages(0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].sender, "alice");
+    }
+
+    #[test]
+    fn migration_v1_file_based_upgrade_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("upgrade_test.db");
+
+        // Create v1 database, insert data, close
+        {
+            let store = MessageStore::open(&db_path).unwrap();
+            let m = make_message("alice", "bob", "Hi", "Persistent");
+            store.insert_message(&m).unwrap();
+            store.upsert_tags(&m.id, &["saved"]).unwrap();
+            store.flush_wal().unwrap();
+        }
+
+        // Reopen — migrate runs again, data survives
+        {
+            let store = MessageStore::open(&db_path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 1);
+
+            let all = store.list_messages(0).unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].body, "Persistent");
+
+            let results = store.messages_by_tag("saved").unwrap();
+            assert_eq!(results.len(), 1);
+
+            let fts = store.search_messages("tags:saved").unwrap();
+            assert_eq!(fts.len(), 1);
+        }
+    }
 }
