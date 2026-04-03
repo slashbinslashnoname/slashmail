@@ -2286,4 +2286,169 @@ mod tests {
             Err(_) => panic!("reply_rx timed out waiting for deferred publish"),
         }
     }
+
+    // ---- Encrypted tag edge-case tests ----
+
+    #[test]
+    fn encrypted_tags_are_opaque_on_wire() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
+        let plaintext_tag = "top-secret";
+        let enc_tag = encryption::seal(shared.as_bytes(), plaintext_tag.as_bytes()).unwrap();
+        let wire_tag = b64.encode(&enc_tag);
+
+        // The wire representation must not contain the plaintext tag.
+        assert!(!wire_tag.contains(plaintext_tag));
+        // Ciphertext must be longer than plaintext (nonce + AEAD overhead).
+        assert!(enc_tag.len() > plaintext_tag.len());
+    }
+
+    #[test]
+    fn encrypted_tag_tampered_ciphertext_fails() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_kp.verifying_key(), b"body").unwrap();
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
+
+        let mut enc_tag = encryption::seal(shared.as_bytes(), b"legit").unwrap();
+        // Flip a byte in the ciphertext (after the 24-byte nonce).
+        let idx = enc_tag.len() - 1;
+        enc_tag[idx] ^= 0xFF;
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        env.tags = vec![b64.encode(&enc_tag)];
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        // Tampered tag must cause decryption failure.
+        let result = process_inbound_envelope(&encoded, &recipient_kp, &store);
+        assert!(result.is_err());
+        assert!(store.list_messages(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn encrypted_tags_wrong_recipient_cannot_decrypt() {
+        let sender_kp = generate_keypair();
+        let intended_kp = generate_keypair();
+        let wrong_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &intended_kp.verifying_key(), b"private").unwrap();
+        let shared = ecdh::derive_shared_secret(&sender_kp, &intended_kp.verifying_key());
+        let enc_tag = encryption::seal(shared.as_bytes(), b"secret-tag").unwrap();
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        env.tags = vec![b64.encode(&enc_tag)];
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        // Wrong recipient cannot decrypt payload or tags.
+        let result = process_inbound_envelope(&encoded, &wrong_kp, &store);
+        assert!(result.is_err());
+        assert!(store.list_messages(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn encrypted_tags_each_get_unique_nonce() {
+        let kp = generate_keypair();
+        let peer_kp = generate_keypair();
+        let shared = ecdh::derive_shared_secret(&kp, &peer_kp.verifying_key());
+
+        // Encrypt the same tag twice — ciphertexts must differ (random nonce).
+        let ct1 = encryption::seal(shared.as_bytes(), b"same-tag").unwrap();
+        let ct2 = encryption::seal(shared.as_bytes(), b"same-tag").unwrap();
+        assert_ne!(ct1, ct2, "each tag encryption must use a unique nonce");
+
+        // Both must still decrypt to the same plaintext.
+        let pt1 = encryption::open(shared.as_bytes(), &ct1).unwrap();
+        let pt2 = encryption::open(shared.as_bytes(), &ct2).unwrap();
+        assert_eq!(pt1, pt2);
+        assert_eq!(pt1, b"same-tag");
+    }
+
+    #[test]
+    fn private_message_with_empty_tags() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_kp.verifying_key(), b"no tags").unwrap();
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        // No tags at all.
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap();
+
+        let msgs = store.list_messages(0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "no tags");
+        assert!(msgs[0].tags.is_empty());
+        assert!(store.get_message_tags(&env.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn encrypted_tags_unicode_roundtrip() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let encrypted_payload =
+            ecdh::seal_for(&sender_kp, &recipient_kp.verifying_key(), b"unicode test").unwrap();
+        let shared = ecdh::derive_shared_secret(&sender_kp, &recipient_kp.verifying_key());
+
+        let unicode_tags = vec!["étiquette", "タグ", "标签"];
+        let encrypted_tags: Vec<String> = unicode_tags
+            .iter()
+            .map(|t| {
+                let ct = encryption::seal(shared.as_bytes(), t.as_bytes()).unwrap();
+                b64.encode(&ct)
+            })
+            .collect();
+
+        let mut env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "dm".into(),
+            encrypted_payload,
+        );
+        env.recipient = Some(libp2p::PeerId::random());
+        env.tags = encrypted_tags;
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap();
+
+        let msgs = store.list_messages(0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        for tag in &unicode_tags {
+            assert!(msgs[0].tags.contains(tag), "missing tag: {tag}");
+        }
+    }
 }
