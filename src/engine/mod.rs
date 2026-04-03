@@ -2888,28 +2888,59 @@ mod tests {
 
     // ---- PeerId-ordered sync initiation tests ----
 
+    /// Build a fake `SwarmEvent::ConnectionEstablished` for unit testing.
+    fn make_connection_established(peer_id: PeerId) -> SwarmEvent<SlashmailBehaviourEvent> {
+        use libp2p::swarm::derive_prelude::{ConnectedPoint, Endpoint, PortUse};
+        use libp2p::swarm::ConnectionId;
+        use std::num::NonZeroU32;
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(0),
+            endpoint: ConnectedPoint::Dialer {
+                address: "/ip4/127.0.0.1/tcp/1234".parse().unwrap(),
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::New,
+            },
+            num_established: NonZeroU32::new(1).unwrap(),
+            concurrent_dial_errors: None,
+            established_in: std::time::Duration::from_millis(0),
+        }
+    }
+
     #[test]
     fn lower_peer_id_initiates_sync_immediately() {
-        // Build two PeerIds with known ordering.
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let peer_a = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
         let peer_b = peer_id_from_ed25519_pubkey(&id_b.public_key()).unwrap();
-
-        let (lower, higher) = if peer_a.to_bytes() < peer_b.to_bytes() {
-            (peer_a, peer_b)
+        let (local_peer, remote_peer) = if peer_a.to_bytes() < peer_b.to_bytes() {
+            (peer_a, peer_b) // local is lower
         } else {
             (peer_b, peer_a)
         };
 
-        // Simulate: local = lower, remote = higher → should include InitiateSync.
-        let local_bytes = lower.to_bytes();
-        let remote_bytes = higher.to_bytes();
-        assert!(local_bytes < remote_bytes, "test setup: lower < higher");
+        let mut in_flight = 0;
+        let mut peers = HashMap::new();
+        let topic_registry = TopicRegistry::new();
+        let mut deferred_syncs = Vec::new();
 
-        // The logic in ConnectionEstablished: if local < remote → InitiateSync.
-        let should_initiate_immediately = local_bytes < remote_bytes;
-        assert!(should_initiate_immediately);
+        let actions = handle_swarm_event(
+            make_connection_established(remote_peer),
+            &mut in_flight,
+            &mut peers,
+            None,
+            None,
+            &topic_registry,
+            local_peer,
+            &mut deferred_syncs,
+        );
+
+        // Lower PeerId must include InitiateSync and must NOT defer.
+        assert!(
+            actions.iter().any(|a| matches!(a, SwarmAction::InitiateSync { .. })),
+            "lower PeerId should include InitiateSync"
+        );
+        assert!(deferred_syncs.is_empty(), "lower PeerId should not defer");
     }
 
     #[test]
@@ -2918,29 +2949,35 @@ mod tests {
         let id_b = Identity::generate();
         let peer_a = peer_id_from_ed25519_pubkey(&id_a.public_key()).unwrap();
         let peer_b = peer_id_from_ed25519_pubkey(&id_b.public_key()).unwrap();
-
-        let (lower, higher) = if peer_a.to_bytes() < peer_b.to_bytes() {
-            (peer_a, peer_b)
+        let (remote_peer, local_peer) = if peer_a.to_bytes() < peer_b.to_bytes() {
+            (peer_a, peer_b) // local is higher
         } else {
             (peer_b, peer_a)
         };
 
-        // Simulate: local = higher, remote = lower → should defer.
-        let mut deferred = Vec::new();
-        let local_bytes = higher.to_bytes();
-        let remote_bytes = lower.to_bytes();
-        assert!(local_bytes > remote_bytes, "test setup: higher > lower");
+        let mut in_flight = 0;
+        let mut peers = HashMap::new();
+        let topic_registry = TopicRegistry::new();
+        let mut deferred_syncs = Vec::new();
 
-        // Should NOT initiate immediately; should add to deferred_syncs.
-        let should_defer = local_bytes >= remote_bytes;
-        assert!(should_defer);
+        let actions = handle_swarm_event(
+            make_connection_established(remote_peer),
+            &mut in_flight,
+            &mut peers,
+            None,
+            None,
+            &topic_registry,
+            local_peer,
+            &mut deferred_syncs,
+        );
 
-        deferred.push(DeferredSync {
-            peer_id: lower,
-            deadline: tokio::time::Instant::now() + SYNC_DEFER_TIMEOUT,
-        });
-        assert_eq!(deferred.len(), 1);
-        assert_eq!(deferred[0].peer_id, lower);
+        // Higher PeerId must NOT include InitiateSync and must add a deferred entry.
+        assert!(
+            !actions.iter().any(|a| matches!(a, SwarmAction::InitiateSync { .. })),
+            "higher PeerId should not include InitiateSync immediately"
+        );
+        assert_eq!(deferred_syncs.len(), 1, "higher PeerId should push a deferred sync");
+        assert_eq!(deferred_syncs[0].peer_id, remote_peer);
     }
 
     #[test]
