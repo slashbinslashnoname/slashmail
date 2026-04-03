@@ -1111,8 +1111,12 @@ fn handle_rr_event(
                 let response = match (keypair, store) {
                     (Some(kp), Some(st)) => {
                         match process_inbound_envelope(&request.envelope_data, kp, st) {
-                            Ok(()) => {
+                            Ok(true) => {
                                 info!(%peer, ?request_id, "inbound private message stored");
+                                MailResponse::accepted()
+                            }
+                            Ok(false) => {
+                                debug!(%peer, ?request_id, "inbound message already stored, ignoring duplicate");
                                 MailResponse::accepted()
                             }
                             Err(e) => {
@@ -1182,8 +1186,11 @@ fn handle_gossipsub_event(
             );
             if let (Some(kp), Some(st)) = (keypair, store) {
                 match process_inbound_envelope(&message.data, kp, st) {
-                    Ok(()) => {
+                    Ok(true) => {
                         info!(%propagation_source, %message_id, "gossipsub message stored");
+                    }
+                    Ok(false) => {
+                        debug!(%propagation_source, %message_id, "gossipsub message already stored, ignoring duplicate");
                     }
                     Err(e) => {
                         warn!(%propagation_source, %message_id, %e, "failed to process gossipsub message");
@@ -1483,8 +1490,11 @@ fn handle_sync_inbound_response(
             for (id_str, raw_data) in &envelopes {
                 if let (Some(kp), Some(st)) = (keypair, Some(st)) {
                     match process_inbound_envelope(raw_data, kp, st) {
-                        Ok(()) => {
+                        Ok(true) => {
                             stored += 1;
+                        }
+                        Ok(false) => {
+                            skipped += 1;
                         }
                         Err(e) => {
                             debug!(%peer, id = %id_str, %e, "sync: failed to process envelope");
@@ -1510,15 +1520,23 @@ fn handle_sync_inbound_response(
 /// - Tags are plaintext strings.
 ///
 /// In both cases the Ed25519 signature on the payload is verified before processing.
+/// Process an inbound envelope, returning `true` if the message was newly
+/// stored or `false` if it was a duplicate that already existed.
 fn process_inbound_envelope(
     data: &[u8],
     keypair: &Keypair,
     store: &MessageStore,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let b64 = base64::engine::general_purpose::STANDARD;
 
     // 1. Decode wire format (version check, decompress, deserialize).
     let envelope = msg_codec::decode(data)?;
+
+    // 1a. Short-circuit if this envelope has already been stored (duplicate
+    //     from gossipsub retransmit, request-response retry, or sync).
+    if store.has_message(&envelope.id)? {
+        return Ok(false);
+    }
 
     // 2. Reconstruct sender public key and verify signature.
     let sender_pubkey = PublicKey::from_bytes(&envelope.sender_pubkey)
@@ -1592,7 +1610,7 @@ fn process_inbound_envelope(
         store.upsert_tags(&envelope.id, &tag_refs)?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1852,6 +1870,30 @@ mod tests {
 
         let tags = store.get_message_tags(&env.id).unwrap();
         assert_eq!(tags, vec!["announce", "inbox"]);
+    }
+
+    #[test]
+    fn process_duplicate_envelope_returns_false() {
+        let sender_kp = generate_keypair();
+        let recipient_kp = generate_keypair();
+
+        let env = Envelope::new(
+            sender_kp.verifying_key().to_bytes(),
+            "chan".into(),
+            b"once".to_vec(),
+        );
+
+        let encoded = msg_codec::encode(&env, &sender_kp).unwrap();
+        let store = MessageStore::open_memory().unwrap();
+
+        // First insert is new.
+        assert!(process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap());
+
+        // Second insert of same envelope is a duplicate.
+        assert!(!process_inbound_envelope(&encoded, &recipient_kp, &store).unwrap());
+
+        // Only one message stored.
+        assert_eq!(store.list_messages(0).unwrap().len(), 1);
     }
 
     #[test]
