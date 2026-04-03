@@ -269,3 +269,127 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::crypto::signing::generate_keypair;
+    use chrono::{TimeZone, Utc};
+    use ed25519_dalek::Signature;
+    use libp2p::PeerId;
+    use proptest::prelude::*;
+    use uuid::Uuid;
+
+    /// Strategy for arbitrary tag strings (printable ASCII, 0..64 chars).
+    fn arb_tag() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_-]{0,64}"
+    }
+
+    /// Strategy for arbitrary tag lists (0..8 tags).
+    fn arb_tags() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(arb_tag(), 0..8)
+    }
+
+    /// Strategy for arbitrary payloads (0..4096 bytes).
+    fn arb_payload() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..4096)
+    }
+
+    /// Strategy for an optional PeerId.
+    fn arb_recipient() -> impl Strategy<Value = Option<PeerId>> {
+        prop::option::of(any::<[u8; 32]>().prop_map(|bytes| {
+            // Derive a deterministic PeerId from random bytes via an ed25519 keypair.
+            let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(bytes.to_vec())
+                .expect("32 bytes is a valid ed25519 secret");
+            let kp = libp2p::identity::ed25519::Keypair::from(secret);
+            let pub_key = libp2p::identity::PublicKey::from(kp.public());
+            PeerId::from_public_key(&pub_key)
+        }))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn roundtrip_preserves_payload(payload in arb_payload()) {
+            let kp = generate_keypair();
+            let mut env = crate::types::Envelope::new(
+                kp.verifying_key().to_bytes(),
+                "proptest-swarm".into(),
+                payload.clone(),
+            );
+            env.signature = Vec::new();
+
+            let encoded = encode(&env, &kp).unwrap();
+            let decoded = decode(&encoded).unwrap();
+
+            prop_assert_eq!(&decoded.payload, &payload);
+            prop_assert_eq!(decoded.id, env.id);
+            prop_assert_eq!(decoded.swarm_id, env.swarm_id);
+        }
+
+        #[test]
+        fn roundtrip_preserves_tags(tags in arb_tags()) {
+            let kp = generate_keypair();
+            let mut env = crate::types::Envelope::new(
+                kp.verifying_key().to_bytes(),
+                "proptest-swarm".into(),
+                vec![1, 2, 3],
+            );
+            env.tags = tags.clone();
+
+            let encoded = encode(&env, &kp).unwrap();
+            let decoded = decode(&encoded).unwrap();
+
+            prop_assert_eq!(&decoded.tags, &tags);
+        }
+
+        #[test]
+        fn roundtrip_preserves_all_fields(
+            payload in arb_payload(),
+            tags in arb_tags(),
+            recipient in arb_recipient(),
+            swarm_id in "[a-z0-9-]{1,32}",
+            _sender_key_seed in any::<[u8; 32]>(),
+            ts_secs in 0i64..4_000_000_000i64,
+        ) {
+            let kp = generate_keypair();
+            let ts = Utc.timestamp_opt(ts_secs, 0).single()
+                .unwrap_or_else(|| Utc::now());
+
+            let env = crate::types::Envelope {
+                id: Uuid::new_v4(),
+                sender_pubkey: kp.verifying_key().to_bytes(),
+                recipient,
+                swarm_id,
+                payload,
+                signature: Vec::new(),
+                timestamp: ts,
+                tags,
+            };
+
+            let encoded = encode(&env, &kp).unwrap();
+            let decoded = decode(&encoded).unwrap();
+
+            // All fields except signature must roundtrip exactly.
+            prop_assert_eq!(decoded.id, env.id);
+            prop_assert_eq!(decoded.sender_pubkey, env.sender_pubkey);
+            prop_assert_eq!(decoded.recipient, env.recipient);
+            prop_assert_eq!(&decoded.swarm_id, &env.swarm_id);
+            prop_assert_eq!(&decoded.payload, &env.payload);
+            prop_assert_eq!(decoded.timestamp, env.timestamp);
+            prop_assert_eq!(&decoded.tags, &env.tags);
+
+            // Signature must be valid.
+            prop_assert_eq!(decoded.signature.len(), 64);
+            let sig = Signature::from_slice(&decoded.signature).unwrap();
+            prop_assert!(
+                crate::crypto::signing::verify(
+                    &kp.verifying_key(),
+                    &decoded.signable_bytes(),
+                    &sig,
+                ).is_ok()
+            );
+        }
+    }
+}
