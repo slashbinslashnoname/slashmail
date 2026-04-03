@@ -12,11 +12,16 @@ use tracing::{debug, info, warn};
 
 use crate::net::behaviour::{SlashmailBehaviour, SlashmailBehaviourEvent};
 use crate::net::rr::{MailRequest, MailResponse};
+use crate::storage::db::{Message, MessageStore};
 
 /// Duration to wait for in-flight requests to drain during shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Commands sent from the CLI (or other callers) to the engine via an mpsc channel.
+///
+/// Read operations (list, search) bypass this channel and use a read-only DB
+/// connection directly. Write operations are routed here so the daemon owns the
+/// sole read-write connection, preventing SQLITE_BUSY contention in WAL mode.
 #[derive(Debug)]
 pub enum EngineCommand {
     /// Subscribe to a gossipsub topic.
@@ -27,6 +32,16 @@ pub enum EngineCommand {
     Dial { addr: Multiaddr },
     /// Start listening on the given multiaddress.
     Listen { addr: Multiaddr },
+    /// Store a message in the local database (and eventually send it over the network).
+    InsertMessage {
+        msg: Message,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Add a peer by dialing its multiaddress and remember it.
+    AddPeer {
+        addr: Multiaddr,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Request a graceful shutdown.
     Shutdown,
 }
@@ -56,6 +71,7 @@ pub enum ShutdownReason {
 pub async fn run_loop(
     mut swarm: Swarm<SlashmailBehaviour>,
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
+    store: Option<MessageStore>,
     wal_flush: Option<Box<dyn FnOnce() + Send>>,
 ) -> ShutdownReason {
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
@@ -80,7 +96,7 @@ pub async fn run_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(command) => {
-                        if let Some(reason) = handle_command(&mut swarm, command) {
+                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref()) {
                             break reason;
                         }
                     }
@@ -149,6 +165,7 @@ async fn drain_in_flight(
 fn handle_command(
     swarm: &mut Swarm<SlashmailBehaviour>,
     command: EngineCommand,
+    store: Option<&MessageStore>,
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
@@ -181,6 +198,35 @@ fn handle_command(
                 Ok(listener_id) => info!(%addr, ?listener_id, "listening"),
                 Err(e) => warn!(%addr, %e, "failed to listen"),
             }
+            None
+        }
+        EngineCommand::InsertMessage { msg, reply } => {
+            let result = match store {
+                Some(s) => s
+                    .insert_message(&msg)
+                    .map_err(|e| format!("insert failed: {e}")),
+                None => Err("no message store available".to_string()),
+            };
+            if let Err(ref e) = result {
+                warn!(%e, "InsertMessage failed");
+            } else {
+                info!(id = %msg.id, "message inserted via daemon");
+            }
+            let _ = reply.send(result);
+            None
+        }
+        EngineCommand::AddPeer { addr, reply } => {
+            let result = match swarm.dial(addr.clone()) {
+                Ok(()) => {
+                    info!(%addr, "peer added and dialing");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(%addr, %e, "failed to add peer");
+                    Err(format!("dial failed: {e}"))
+                }
+            };
+            let _ = reply.send(result);
             None
         }
         EngineCommand::Shutdown => {
@@ -310,7 +356,7 @@ mod tests {
         let (swarm, tx, rx) = setup().await;
 
         tx.send(EngineCommand::Shutdown).await.unwrap();
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -319,7 +365,7 @@ mod tests {
         let (swarm, tx, rx) = setup().await;
 
         drop(tx);
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::ChannelClosed);
     }
 
@@ -334,7 +380,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -349,7 +395,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -364,7 +410,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -380,7 +426,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -410,7 +456,7 @@ mod tests {
         .unwrap();
         tx.send(EngineCommand::Shutdown).await.unwrap();
 
-        let reason = run_loop(swarm, rx, None).await;
+        let reason = run_loop(swarm, rx, None, None).await;
         assert_eq!(reason, ShutdownReason::Command);
     }
 
@@ -425,7 +471,7 @@ mod tests {
         });
 
         tx.send(EngineCommand::Shutdown).await.unwrap();
-        let reason = run_loop(swarm, rx, Some(wal_flush)).await;
+        let reason = run_loop(swarm, rx, None, Some(wal_flush)).await;
 
         assert_eq!(reason, ShutdownReason::Command);
         assert!(flushed.load(Ordering::SeqCst), "WAL flush callback must be called on shutdown");
@@ -442,7 +488,7 @@ mod tests {
         });
 
         drop(tx);
-        let reason = run_loop(swarm, rx, Some(wal_flush)).await;
+        let reason = run_loop(swarm, rx, None, Some(wal_flush)).await;
 
         assert_eq!(reason, ShutdownReason::ChannelClosed);
         assert!(flushed.load(Ordering::SeqCst), "WAL flush callback must be called on channel close");
@@ -460,5 +506,88 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(elapsed < Duration::from_millis(100), "drain should return immediately with 0 in-flight");
+    }
+
+    #[tokio::test]
+    async fn insert_message_via_command_with_store() {
+        let (swarm, tx, rx) = setup().await;
+        let store = MessageStore::open_memory().unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = Message {
+            id: uuid::Uuid::new_v4(),
+            swarm_id: "test".to_string(),
+            folder_path: "INBOX".to_string(),
+            sender_pubkey: [0xAA; 32],
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            subject: "Test".to_string(),
+            body: "Hello".to_string(),
+            tags: String::new(),
+            created_at: chrono::Utc::now(),
+            read: false,
+        };
+
+        tx.send(EngineCommand::InsertMessage { msg, reply: reply_tx })
+            .await
+            .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        let reason = run_loop(swarm, rx, Some(store), None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_ok(), "InsertMessage should succeed with a store");
+    }
+
+    #[tokio::test]
+    async fn insert_message_fails_without_store() {
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = Message {
+            id: uuid::Uuid::new_v4(),
+            swarm_id: "test".to_string(),
+            folder_path: "INBOX".to_string(),
+            sender_pubkey: [0xAA; 32],
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            subject: "Test".to_string(),
+            body: "Hello".to_string(),
+            tags: String::new(),
+            created_at: chrono::Utc::now(),
+            read: false,
+        };
+
+        tx.send(EngineCommand::InsertMessage { msg, reply: reply_tx })
+            .await
+            .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        let reason = run_loop(swarm, rx, None, None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_err(), "InsertMessage should fail without a store");
+    }
+
+    #[tokio::test]
+    async fn add_peer_via_command() {
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::AddPeer {
+            addr: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        let reason = run_loop(swarm, rx, None, None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        // AddPeer dials the address — result depends on network, but should not panic.
+        let _result = reply_rx.await.unwrap();
     }
 }
