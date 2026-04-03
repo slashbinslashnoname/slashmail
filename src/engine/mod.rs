@@ -3022,4 +3022,81 @@ mod tests {
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].peer_id, peer_b);
     }
+
+    #[tokio::test]
+    async fn send_message_increments_in_flight() {
+        let sender_identity = Identity::generate();
+        let sender_kp = sender_identity.keypair().clone();
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let (mut swarm, _tx, _rx) = setup().await;
+        let peers = HashMap::new();
+        let mut topic_registry = TopicRegistry::new();
+        let mut in_flight: usize = 0;
+        let mut pending_publishes = Vec::new();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "hello".into(),
+            tags: vec![],
+            reply: reply_tx,
+        };
+
+        let result = handle_command(
+            &mut swarm,
+            cmd,
+            None,
+            &peers,
+            &mut topic_registry,
+            Some(&sender_kp),
+            &mut in_flight,
+            &mut pending_publishes,
+        );
+
+        assert!(result.is_none(), "SendMessage should not trigger shutdown");
+        assert_eq!(in_flight, 1, "in_flight must be incremented after send_request");
+
+        let reply = reply_rx.await.unwrap();
+        assert!(reply.is_ok(), "SendMessage should succeed: {:?}", reply);
+    }
+
+    #[tokio::test]
+    async fn send_message_no_keypair_does_not_increment_in_flight() {
+        let recipient_kp = generate_keypair();
+        let recipient_b64 = base64::engine::general_purpose::STANDARD
+            .encode(recipient_kp.verifying_key().to_bytes());
+
+        let (mut swarm, _tx, _rx) = setup().await;
+        let peers = HashMap::new();
+        let mut topic_registry = TopicRegistry::new();
+        let mut in_flight: usize = 0;
+        let mut pending_publishes = Vec::new();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = EngineCommand::SendMessage {
+            to: recipient_b64,
+            body: "test".into(),
+            tags: vec![],
+            reply: reply_tx,
+        };
+
+        handle_command(
+            &mut swarm,
+            cmd,
+            None,
+            &peers,
+            &mut topic_registry,
+            None,
+            &mut in_flight,
+            &mut pending_publishes,
+        );
+
+        assert_eq!(in_flight, 0, "in_flight must not increment when send fails");
+
+        let reply = reply_rx.await.unwrap();
+        assert!(reply.is_err());
+    }
 }
