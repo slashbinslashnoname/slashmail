@@ -41,6 +41,8 @@ pub enum CtlResponse {
         ok: bool,
         message_id: Option<String>,
         error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     Error { message: String },
 }
@@ -200,15 +202,17 @@ async fn dispatch(req: CtlRequest, cmd_tx: &mpsc::Sender<EngineCommand>) -> CtlR
                 };
             }
             match reply_rx.await {
-                Ok(Ok(message_id)) => CtlResponse::Send {
+                Ok(Ok((message_id, warning))) => CtlResponse::Send {
                     ok: true,
                     message_id: Some(message_id),
                     error: None,
+                    warning,
                 },
                 Ok(Err(e)) => CtlResponse::Send {
                     ok: false,
                     message_id: None,
                     error: Some(e),
+                    warning: None,
                 },
                 Err(_) => CtlResponse::Error {
                     message: "engine did not respond".into(),
@@ -332,6 +336,7 @@ mod tests {
             ok: true,
             message_id: Some("abc-123".into()),
             error: None,
+            warning: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: CtlResponse = serde_json::from_str(&json).unwrap();
@@ -340,6 +345,7 @@ mod tests {
                 ok,
                 message_id,
                 error,
+                ..
             } => {
                 assert!(ok);
                 assert_eq!(message_id.as_deref(), Some("abc-123"));
@@ -355,6 +361,7 @@ mod tests {
             ok: false,
             message_id: None,
             error: Some("bad key".into()),
+            warning: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: CtlResponse = serde_json::from_str(&json).unwrap();

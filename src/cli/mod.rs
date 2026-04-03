@@ -360,6 +360,7 @@ pub async fn run(args: Args) -> Result<()> {
                 CtlResponse::Send {
                     ok: true,
                     message_id,
+                    warning,
                     ..
                 } => {
                     let mid = message_id.unwrap_or_default();
@@ -370,6 +371,9 @@ pub async fn run(args: Args) -> Result<()> {
                     ctx.print_success(&result, || {
                         println!("Message sent to {to} (id: {mid})");
                     });
+                    if let Some(w) = warning {
+                        eprintln!("warning: {w}");
+                    }
                     Ok(())
                 }
                 CtlResponse::Send {
