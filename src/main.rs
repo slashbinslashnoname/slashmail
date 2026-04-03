@@ -21,14 +21,26 @@ use error::AppError;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
-
     let args = cli::Args::parse();
+
+    // When emitting structured JSON on stdout, redirect logs to stderr so that
+    // stdout contains only machine-readable output.
+    if args.json {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
     let ctx = OutputContext::new(args.json);
 
     if let Err(err) = cli::run(args).await {
