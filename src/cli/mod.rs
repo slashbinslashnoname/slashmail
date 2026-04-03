@@ -1,4 +1,5 @@
 mod init;
+pub mod output;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
