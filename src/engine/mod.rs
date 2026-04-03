@@ -61,10 +61,19 @@ pub struct PeerInfo {
 /// sole read-write connection, preventing SQLITE_BUSY contention in WAL mode.
 #[derive(Debug)]
 pub enum EngineCommand {
-    /// Subscribe to a gossipsub topic.
+    /// Subscribe to a gossipsub topic (SHA-256 hashed on the wire).
     Subscribe { topic: String },
     /// Unsubscribe from a gossipsub topic.
     Unsubscribe { topic: String },
+    /// Broadcast a public message via gossipsub.
+    ///
+    /// `topic` is the human-readable topic string (e.g. `"pub_general"`);
+    /// `data` is the codec-encoded envelope bytes ready for the wire.
+    PublishPublic {
+        topic: String,
+        data: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Dial a remote peer at the given multiaddress.
     Dial { addr: Multiaddr },
     /// Start listening on the given multiaddress.
@@ -226,7 +235,7 @@ fn handle_command(
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
-            let gossipsub_topic = libp2p::gossipsub::IdentTopic::new(&topic);
+            let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
             match swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic) {
                 Ok(true) => info!(%topic, "subscribed to topic"),
                 Ok(false) => debug!(%topic, "already subscribed to topic"),
@@ -235,12 +244,25 @@ fn handle_command(
             None
         }
         EngineCommand::Unsubscribe { topic } => {
-            let gossipsub_topic = libp2p::gossipsub::IdentTopic::new(&topic);
+            let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
             match swarm.behaviour_mut().gossipsub.unsubscribe(&gossipsub_topic) {
                 Ok(true) => info!(%topic, "unsubscribed from topic"),
                 Ok(false) => debug!(%topic, "was not subscribed to topic"),
                 Err(e) => warn!(%topic, %e, "failed to unsubscribe from topic"),
             }
+            None
+        }
+        EngineCommand::PublishPublic { topic, data, reply } => {
+            let gossipsub_topic = libp2p::gossipsub::Sha256Topic::new(&topic);
+            let result = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(gossipsub_topic, data)
+                .map(|msg_id| {
+                    info!(%topic, %msg_id, "published public message");
+                })
+                .map_err(|e| format!("gossipsub publish failed: {e}"));
+            let _ = reply.send(result);
             None
         }
         EngineCommand::Dial { addr } => {
@@ -1286,6 +1308,56 @@ mod tests {
         assert_eq!(reason, ShutdownReason::Command);
 
         // AddPeer dials the address — result depends on network, but should not panic.
+        let _result = reply_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_public_without_subscription_fails() {
+        let (swarm, tx, rx) = setup().await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::PublishPublic {
+            topic: "pub_general".into(),
+            data: b"hello world".to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        let reason = run_loop(swarm, rx, None, None, None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        // Publishing without subscribing first should fail (no peers in mesh).
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_err(), "publish should fail without subscription");
+    }
+
+    #[tokio::test]
+    async fn subscribe_then_publish_does_not_panic() {
+        let (swarm, tx, rx) = setup().await;
+
+        tx.send(EngineCommand::Subscribe {
+            topic: "pub_general".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::PublishPublic {
+            topic: "pub_general".into(),
+            data: b"test payload".to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        let reason = run_loop(swarm, rx, None, None, None).await;
+        assert_eq!(reason, ShutdownReason::Command);
+
+        // With no peers the publish may succeed (message stored locally) or fail
+        // depending on gossipsub config. Either way it must not panic.
         let _result = reply_rx.await.unwrap();
     }
 }
