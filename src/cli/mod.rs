@@ -3,6 +3,7 @@ pub mod output;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::ctl::{self, CtlRequest, CtlResponse};
@@ -10,12 +11,19 @@ use crate::error::AppError;
 use crate::storage::config::Config;
 use crate::storage::db::ReadOnlyMessageStore;
 
+pub use output::OutputContext;
+
 #[cfg(test)]
 mod tests;
 
 #[derive(Parser)]
 #[command(name = "slashmail", about = "Peer-to-peer encrypted mail")]
 pub struct Args {
+    /// Output JSON instead of human-readable text.
+    /// Auto-enabled when stdout is not a TTY.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -144,15 +152,97 @@ fn print_message_table(messages: &[crate::storage::db::Message], empty_msg: &str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Serializable data types for JSON output
+// ---------------------------------------------------------------------------
+
+/// JSON-serializable message summary (used by list/search commands).
+#[derive(Debug, Serialize)]
+struct MessageJson {
+    id: String,
+    sender: String,
+    recipient: String,
+    subject: String,
+    body: String,
+    tags: Vec<String>,
+    created_at: String,
+    read: bool,
+}
+
+impl From<&crate::storage::db::Message> for MessageJson {
+    fn from(msg: &crate::storage::db::Message) -> Self {
+        Self {
+            id: msg.id.to_string(),
+            sender: msg.sender.clone(),
+            recipient: msg.recipient.clone(),
+            subject: msg.subject.clone(),
+            body: msg.body.clone(),
+            tags: if msg.tags.is_empty() {
+                vec![]
+            } else {
+                msg.tags.split_whitespace().map(String::from).collect()
+            },
+            created_at: msg.created_at.to_rfc3339(),
+            read: msg.read,
+        }
+    }
+}
+
+/// JSON payload for init command.
+#[derive(Debug, Serialize)]
+struct InitResult {
+    public_key: String,
+}
+
+/// JSON payload for status command.
+#[derive(Debug, Serialize)]
+struct StatusResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    listen_addr: String,
+    daemon: DaemonStatus,
+}
+
+/// Daemon status sub-payload.
+#[derive(Debug, Serialize)]
+struct DaemonStatus {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen_addrs: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_addrs: Option<Vec<String>>,
+}
+
+/// JSON payload for add-peer command.
+#[derive(Debug, Serialize)]
+struct AddPeerResult {
+    addr: String,
+}
+
+/// JSON payload for messages list/search.
+#[derive(Debug, Serialize)]
+struct MessagesResult {
+    messages: Vec<MessageJson>,
+    count: usize,
+}
+
 pub async fn run(args: Args) -> Result<()> {
+    let ctx = OutputContext::new(args.json);
+
     match args.command {
         Command::Init => {
             tracing::info!("initializing identity");
-            init::run().await
+            init::run(&ctx).await
         }
         Command::Status => {
             tracing::info!("showing status");
-            init::status().await
+            init::status(&ctx).await
         }
         Command::Send { .. } => {
             // Write operations must route through the daemon command channel
@@ -163,7 +253,11 @@ pub async fn run(args: Args) -> Result<()> {
             tracing::info!(?tag, "listing messages");
             let db_path = Config::db_path()?;
             if !db_path.exists() {
-                println!("No messages yet. Run `slashmail init` first.");
+                let empty: Vec<MessageJson> = vec![];
+                let result = MessagesResult { messages: empty, count: 0 };
+                ctx.print_success(&result, || {
+                    println!("No messages yet. Run `slashmail init` first.");
+                });
                 return Ok(());
             }
             let store = ReadOnlyMessageStore::open(&db_path)?;
@@ -171,19 +265,31 @@ pub async fn run(args: Args) -> Result<()> {
                 Some(ref t) => store.messages_by_tag(t)?,
                 None => store.list_messages(50)?,
             };
-            print_message_table(&messages, "No messages found.");
+            let json_msgs: Vec<MessageJson> = messages.iter().map(MessageJson::from).collect();
+            let result = MessagesResult { count: json_msgs.len(), messages: json_msgs };
+            ctx.print_success(&result, || {
+                print_message_table(&messages, "No messages found.");
+            });
             Ok(())
         }
         Command::Search { ref query } => {
             tracing::info!(%query, "searching messages");
             let db_path = Config::db_path()?;
             if !db_path.exists() {
-                println!("No messages yet. Run `slashmail init` first.");
+                let empty: Vec<MessageJson> = vec![];
+                let result = MessagesResult { messages: empty, count: 0 };
+                ctx.print_success(&result, || {
+                    println!("No messages yet. Run `slashmail init` first.");
+                });
                 return Ok(());
             }
             let store = ReadOnlyMessageStore::open(&db_path)?;
             let results = store.search_messages(query)?;
-            print_message_table(&results, &format!("No messages match \"{query}\"."));
+            let json_msgs: Vec<MessageJson> = results.iter().map(MessageJson::from).collect();
+            let result = MessagesResult { count: json_msgs.len(), messages: json_msgs };
+            ctx.print_success(&result, || {
+                print_message_table(&results, &format!("No messages match \"{query}\"."));
+            });
             Ok(())
         }
         Command::AddPeer { addr } => {
@@ -191,7 +297,10 @@ pub async fn run(args: Args) -> Result<()> {
             let resp = ctl::send_request(&CtlRequest::AddPeer { addr: addr.clone() }).await?;
             match resp {
                 CtlResponse::AddPeer { ok: true, .. } => {
-                    println!("Dialing {addr}");
+                    let result = AddPeerResult { addr: addr.clone() };
+                    ctx.print_success(&result, || {
+                        println!("Dialing {addr}");
+                    });
                     Ok(())
                 }
                 CtlResponse::AddPeer {
@@ -214,36 +323,37 @@ pub async fn run(args: Args) -> Result<()> {
             let resp = ctl::send_request(&CtlRequest::Peers).await?;
             match resp {
                 CtlResponse::Peers { peers } => {
-                    if peers.is_empty() {
-                        println!("No connected peers.");
-                    } else {
-                        let rows: Vec<PeerRow> = peers
-                            .into_iter()
-                            .map(|p| {
-                                // Truncate PeerId for display (keep first 16 chars + ...)
-                                let short_id = truncate_chars(&p.peer_id, 16);
-                                PeerRow {
-                                    peer_id: short_id,
-                                    addrs: if p.addrs.is_empty() {
-                                        "-".into()
-                                    } else {
-                                        p.addrs.join(", ")
-                                    },
-                                    connected_since: p.connected_since,
-                                    protocols: if p.protocols.is_empty() {
-                                        "-".into()
-                                    } else {
-                                        p.protocols.join(", ")
-                                    },
-                                    rtt: p
-                                        .rtt_ms
-                                        .map(|ms| format!("{ms:.1}"))
-                                        .unwrap_or_else(|| "-".into()),
-                                }
-                            })
-                            .collect();
-                        println!("{}", Table::new(rows));
-                    }
+                    ctx.print_success(&peers, || {
+                        if peers.is_empty() {
+                            println!("No connected peers.");
+                        } else {
+                            let rows: Vec<PeerRow> = peers
+                                .iter()
+                                .map(|p| {
+                                    let short_id = truncate_chars(&p.peer_id, 16);
+                                    PeerRow {
+                                        peer_id: short_id,
+                                        addrs: if p.addrs.is_empty() {
+                                            "-".into()
+                                        } else {
+                                            p.addrs.join(", ")
+                                        },
+                                        connected_since: p.connected_since.clone(),
+                                        protocols: if p.protocols.is_empty() {
+                                            "-".into()
+                                        } else {
+                                            p.protocols.join(", ")
+                                        },
+                                        rtt: p
+                                            .rtt_ms
+                                            .map(|ms| format!("{ms:.1}"))
+                                            .unwrap_or_else(|| "-".into()),
+                                    }
+                                })
+                                .collect();
+                            println!("{}", Table::new(rows));
+                        }
+                    });
                     Ok(())
                 }
                 CtlResponse::Error { message } => {

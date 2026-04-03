@@ -1,6 +1,7 @@
 use clap::Parser;
 
-use super::{message_rows, truncate_chars, Args, Command};
+use super::{message_rows, truncate_chars, Args, Command, MessageJson, MessagesResult};
+use crate::cli::output::OutputContext;
 use crate::storage::db::Message;
 use chrono::Utc;
 use uuid::Uuid;
@@ -14,6 +15,7 @@ fn parse(args: &[&str]) -> Args {
 fn parse_init() {
     let args = parse(&["slashmail", "init"]);
     assert!(matches!(args.command, Command::Init));
+    assert!(!args.json);
 }
 
 #[test]
@@ -109,6 +111,69 @@ fn inbox_is_not_a_command() {
     assert!(result.is_err(), "inbox should no longer be a valid subcommand");
 }
 
+// -- --json flag parsing ---------------------------------------------------
+
+#[test]
+fn parse_json_flag_before_subcommand() {
+    let args = parse(&["slashmail", "--json", "status"]);
+    assert!(args.json);
+    assert!(matches!(args.command, Command::Status));
+}
+
+#[test]
+fn parse_json_flag_after_subcommand() {
+    let args = parse(&["slashmail", "list", "--json"]);
+    assert!(args.json);
+    assert!(matches!(args.command, Command::List { .. }));
+}
+
+#[test]
+fn parse_no_json_flag() {
+    let args = parse(&["slashmail", "status"]);
+    assert!(!args.json);
+}
+
+#[test]
+fn parse_json_flag_with_other_args() {
+    let args = parse(&["slashmail", "--json", "list", "--tag", "inbox"]);
+    assert!(args.json);
+    match args.command {
+        Command::List { tag } => assert_eq!(tag.as_deref(), Some("inbox")),
+        _ => panic!("expected List"),
+    }
+}
+
+// -- OutputContext integration ---------------------------------------------
+
+#[test]
+fn output_context_from_json_flag() {
+    let ctx = OutputContext::new(true);
+    assert!(ctx.is_json());
+}
+
+#[test]
+fn output_context_print_success_json_mode() {
+    let ctx = OutputContext::forced(true);
+    let data = serde_json::json!({"key": "value"});
+    // Should not panic; in a real test we'd capture stdout.
+    ctx.print_success(&data, || {
+        panic!("human closure should not be called in JSON mode");
+    });
+}
+
+#[test]
+fn output_context_print_success_human_mode() {
+    let ctx = OutputContext::forced(false);
+    let mut called = false;
+    let data = serde_json::json!({"key": "value"});
+    ctx.print_success(&data, || {
+        called = true;
+    });
+    assert!(called, "human closure should be called in human mode");
+}
+
+// -- MessageJson conversion ------------------------------------------------
+
 /// Helper to create a test message with sensible defaults.
 fn test_message(sender: &str, subject: &str, body: &str, tags: &str) -> Message {
     Message {
@@ -127,6 +192,41 @@ fn test_message(sender: &str, subject: &str, body: &str, tags: &str) -> Message 
 }
 
 #[test]
+fn message_json_from_message() {
+    let msg = test_message("alice", "Hello", "Hi there", "inbox urgent");
+    let json = MessageJson::from(&msg);
+    assert_eq!(json.sender, "alice");
+    assert_eq!(json.subject, "Hello");
+    assert_eq!(json.body, "Hi there");
+    assert_eq!(json.tags, vec!["inbox", "urgent"]);
+    assert!(!json.read);
+    assert_eq!(json.recipient, "bob");
+}
+
+#[test]
+fn message_json_empty_tags() {
+    let msg = test_message("alice", "Hi", "body", "");
+    let json = MessageJson::from(&msg);
+    assert!(json.tags.is_empty());
+}
+
+#[test]
+fn messages_result_serializes() {
+    let msg = test_message("alice", "Hello", "body", "inbox");
+    let json_msgs: Vec<MessageJson> = vec![MessageJson::from(&msg)];
+    let result = MessagesResult {
+        count: json_msgs.len(),
+        messages: json_msgs,
+    };
+    let value: serde_json::Value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["count"], 1);
+    assert!(value["messages"].is_array());
+    assert_eq!(value["messages"][0]["sender"], "alice");
+}
+
+// -- Table display (unchanged) ---------------------------------------------
+
+#[test]
 fn truncate_chars_ascii_no_truncation() {
     assert_eq!(truncate_chars("hello", 10), "hello");
 }
@@ -138,7 +238,6 @@ fn truncate_chars_ascii_truncates() {
 
 #[test]
 fn truncate_chars_multibyte_does_not_panic() {
-    // Each char here is a 3-byte UTF-8 sequence; naive byte slicing would panic.
     let s = "こんにちは世界これはテスト"; // 13 Japanese chars
     let result = truncate_chars(s, 5);
     assert_eq!(result, "こんにちは…");
@@ -206,7 +305,6 @@ fn message_rows_empty_body_shows_dash() {
 fn message_rows_formats_timestamp() {
     let msgs = vec![test_message("alice", "Hi", "body", "")];
     let rows = message_rows(&msgs);
-    // Should be in YYYY-MM-DD HH:MM format
     assert!(rows[0].timestamp.len() == 16, "timestamp should be 16 chars: {}", rows[0].timestamp);
 }
 

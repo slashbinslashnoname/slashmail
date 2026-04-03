@@ -3,6 +3,8 @@
 use anyhow::Result;
 use libp2p::PeerId;
 
+use super::{DaemonStatus, InitResult, StatusResult};
+use crate::cli::output::OutputContext;
 use crate::ctl::{self, CtlRequest, CtlResponse};
 use crate::identity::Identity;
 use crate::net;
@@ -10,7 +12,7 @@ use crate::storage::Config;
 
 /// Run the init command: generate an Ed25519 keypair, store the private key
 /// in the OS keyring, and write the public key to config.toml.
-pub async fn run() -> Result<()> {
+pub async fn run(ctx: &OutputContext) -> Result<()> {
     // Check if an identity already exists in config
     let config = Config::load()?;
     if config.public_key.is_some() {
@@ -30,17 +32,21 @@ pub async fn run() -> Result<()> {
 
     // Write the public key into config.toml
     let mut config = config;
-    config.public_key = Some(identity.public_key_base64());
+    let pk = identity.public_key_base64();
+    config.public_key = Some(pk.clone());
     config.save()?;
 
-    println!("Identity initialised.");
-    println!("Public key: {}", identity.public_key_base64());
+    let result = InitResult { public_key: pk.clone() };
+    ctx.print_success(&result, || {
+        println!("Identity initialised.");
+        println!("Public key: {pk}");
+    });
 
     Ok(())
 }
 
 /// Show node status: identity info (always available) + daemon info (if running).
-pub async fn status() -> Result<()> {
+pub async fn status(ctx: &OutputContext) -> Result<()> {
     let config = Config::load()?;
     match config.public_key {
         Some(ref pk) => {
@@ -57,35 +63,71 @@ pub async fn status() -> Result<()> {
             let libp2p_keypair = net::convert_keypair(&identity)?;
             let peer_id = PeerId::from(libp2p_keypair.public());
 
-            if let Some(ref name) = config.display_name {
-                println!("Name:       {name}");
-            }
-            println!("Public key: {pk}");
-            println!("Peer ID:    {peer_id}");
-            println!("Listen:     {}", config.listen_addr);
-
             // Try to reach the daemon for live info.
-            match ctl::send_request(&CtlRequest::Status).await {
-                Ok(CtlResponse::Status(info)) => {
-                    println!("Daemon:     running ({} peer(s) connected)", info.num_peers);
-                    if !info.listen_addrs.is_empty() {
-                        for addr in &info.listen_addrs {
+            let daemon = match ctl::send_request(&CtlRequest::Status).await {
+                Ok(CtlResponse::Status(info)) => DaemonStatus {
+                    running: true,
+                    num_peers: Some(info.num_peers),
+                    listen_addrs: Some(info.listen_addrs.clone()),
+                    external_addrs: Some(info.external_addrs.clone()),
+                },
+                _ => DaemonStatus {
+                    running: false,
+                    num_peers: None,
+                    listen_addrs: None,
+                    external_addrs: None,
+                },
+            };
+
+            let result = StatusResult {
+                display_name: config.display_name.clone(),
+                public_key: Some(pk.clone()),
+                peer_id: Some(peer_id.to_string()),
+                listen_addr: config.listen_addr.clone(),
+                daemon: daemon,
+            };
+
+            ctx.print_success(&result, || {
+                if let Some(ref name) = result.display_name {
+                    println!("Name:       {name}");
+                }
+                println!("Public key: {pk}");
+                println!("Peer ID:    {peer_id}");
+                println!("Listen:     {}", config.listen_addr);
+                if result.daemon.running {
+                    let np = result.daemon.num_peers.unwrap_or(0);
+                    println!("Daemon:     running ({np} peer(s) connected)");
+                    if let Some(ref addrs) = result.daemon.listen_addrs {
+                        for addr in addrs {
                             println!("  listen:   {addr}");
                         }
                     }
-                    if !info.external_addrs.is_empty() {
-                        for addr in &info.external_addrs {
+                    if let Some(ref addrs) = result.daemon.external_addrs {
+                        for addr in addrs {
                             println!("  external: {addr}");
                         }
                     }
-                }
-                _ => {
+                } else {
                     println!("Daemon:     not running");
                 }
-            }
+            });
         }
         None => {
-            println!("No identity found. Run `slashmail init` to create one.");
+            let result = StatusResult {
+                display_name: None,
+                public_key: None,
+                peer_id: None,
+                listen_addr: config.listen_addr.clone(),
+                daemon: DaemonStatus {
+                    running: false,
+                    num_peers: None,
+                    listen_addrs: None,
+                    external_addrs: None,
+                },
+            };
+            ctx.print_success(&result, || {
+                println!("No identity found. Run `slashmail init` to create one.");
+            });
         }
     }
     Ok(())
