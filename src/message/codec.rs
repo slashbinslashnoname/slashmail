@@ -171,4 +171,11 @@ mod tests {
         let result = decode(&[CODEC_VERSION, 0xFF, 0xFE, 0xFD]);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn decode_rejects_version_only_payload() {
+        // Just the version byte with no compressed body — should not panic, must error.
+        let result = decode(&[CODEC_VERSION]);
+        assert!(result.is_err());
+    }
 }
