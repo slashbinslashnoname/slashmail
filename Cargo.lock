@@ -1667,6 +1667,10 @@ dependencies = [
  "libp2p-metrics",
  "libp2p-noise",
  "libp2p-quic",
+<<<<<<< HEAD
+=======
+ "libp2p-request-response",
+>>>>>>> master
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -1936,6 +1940,29 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
+name = "libp2p-request-response"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1356c9e376a94a75ae830c42cdaea3d4fe1290ba409a22c809033d1b7dcab0a6"
+dependencies = [
+ "async-trait",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.5",
+ "smallvec",
+ "tracing",
+ "void",
+ "web-time",
+]
+
+[[package]]
+>>>>>>> master
 name = "libp2p-swarm"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3102,6 +3129,10 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slashmail"
 version = "0.1.0"
 dependencies = [
+<<<<<<< HEAD
+=======
+ "aes-gcm",
+>>>>>>> master
  "anyhow",
  "base64",
  "bincode",
@@ -3112,6 +3143,10 @@ dependencies = [
  "ed25519-dalek",
  "keyring",
  "libp2p",
+<<<<<<< HEAD
+=======
+ "libp2p-quic",
+>>>>>>> master
  "rand 0.8.5",
  "rusqlite",
  "serde",
@@ -3125,6 +3160,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+<<<<<<< HEAD
+=======
+ "x25519-dalek",
+>>>>>>> master
  "zstd",
 ]
 
