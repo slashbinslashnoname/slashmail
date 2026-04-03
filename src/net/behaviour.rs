@@ -1,5 +1,6 @@
 //! Composite network behaviour combining Gossipsub, Kademlia, Identify, mDNS,
-//! and request-response for direct mail delivery.
+//! request-response for direct mail delivery, relay client, dcutr (NAT
+//! hole-punching), and autonat (NAT status detection).
 
 use libp2p::identity::Keypair;
 use libp2p::{
