@@ -1,8 +1,11 @@
 //! `slashmail init` — generate a new identity and persist it.
 
 use anyhow::Result;
+use libp2p::PeerId;
 
+use crate::ctl::{self, CtlRequest, CtlResponse};
 use crate::identity::Identity;
+use crate::net;
 use crate::storage::Config;
 
 /// Run the init command: generate an Ed25519 keypair, store the private key
@@ -36,12 +39,12 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Run the whoami command: load identity and display it.
-pub async fn whoami() -> Result<()> {
+/// Show node status: identity info (always available) + daemon info (if running).
+pub async fn status() -> Result<()> {
     let config = Config::load()?;
     match config.public_key {
         Some(ref pk) => {
-            // Verify the keyring has the matching private key
+            // Verify the keyring has the matching private key.
             let identity = Identity::load_from_keyring()?;
             let stored_pk = identity.public_key_base64();
             if stored_pk != *pk {
@@ -49,10 +52,37 @@ pub async fn whoami() -> Result<()> {
                     "keyring public key ({stored_pk}) does not match config ({pk}) — identity may be corrupted"
                 );
             }
+
+            // Derive PeerId from the identity keypair.
+            let libp2p_keypair = net::convert_keypair(&identity)?;
+            let peer_id = PeerId::from(libp2p_keypair.public());
+
             if let Some(ref name) = config.display_name {
                 println!("Name:       {name}");
             }
             println!("Public key: {pk}");
+            println!("Peer ID:    {peer_id}");
+            println!("Listen:     {}", config.listen_addr);
+
+            // Try to reach the daemon for live info.
+            match ctl::send_request(&CtlRequest::Status).await {
+                Ok(CtlResponse::Status(info)) => {
+                    println!("Daemon:     running ({} peer(s) connected)", info.num_peers);
+                    if !info.listen_addrs.is_empty() {
+                        for addr in &info.listen_addrs {
+                            println!("  listen:   {addr}");
+                        }
+                    }
+                    if !info.external_addrs.is_empty() {
+                        for addr in &info.external_addrs {
+                            println!("  external: {addr}");
+                        }
+                    }
+                }
+                _ => {
+                    println!("Daemon:     not running");
+                }
+            }
         }
         None => {
             println!("No identity found. Run `slashmail init` to create one.");

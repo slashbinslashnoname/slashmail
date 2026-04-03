@@ -1,13 +1,16 @@
 //! Engine: central event loop multiplexing swarm events, CLI commands, and OS signals.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine as _;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::Signature;
 use futures::StreamExt;
-use libp2p::{gossipsub, request_response};
+use libp2p::{gossipsub, identify, ping, request_response};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, Swarm};
+use libp2p::{Multiaddr, PeerId, Swarm};
+use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -22,6 +25,34 @@ use crate::storage::db::{Message, MessageStore};
 
 /// Duration to wait for in-flight requests to drain during shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-peer tracking state maintained by the engine.
+#[derive(Debug, Clone)]
+struct PeerState {
+    connected_since: DateTime<Utc>,
+    protocols: Vec<String>,
+    listen_addrs: Vec<Multiaddr>,
+    rtt: Option<Duration>,
+}
+
+/// Status information returned by the engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusInfo {
+    pub peer_id: String,
+    pub listen_addrs: Vec<String>,
+    pub external_addrs: Vec<String>,
+    pub num_peers: usize,
+}
+
+/// Information about a connected peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub addrs: Vec<String>,
+    pub connected_since: String,
+    pub protocols: Vec<String>,
+    pub rtt_ms: Option<f64>,
+}
 
 /// Commands sent from the CLI (or other callers) to the engine via an mpsc channel.
 ///
@@ -47,6 +78,14 @@ pub enum EngineCommand {
     AddPeer {
         addr: Multiaddr,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Query the node status (PeerId, listen/external addrs, peer count).
+    GetStatus {
+        reply: tokio::sync::oneshot::Sender<StatusInfo>,
+    },
+    /// Query connected peers with metadata.
+    GetPeers {
+        reply: tokio::sync::oneshot::Sender<Vec<PeerInfo>>,
     },
     /// Request a graceful shutdown.
     Shutdown,
@@ -88,6 +127,7 @@ pub async fn run_loop(
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     let mut in_flight: usize = 0;
+    let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
 
     info!("engine event loop started");
 
@@ -107,7 +147,7 @@ pub async fn run_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(command) => {
-                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref()) {
+                        if let Some(reason) = handle_command(&mut swarm, command, store.as_ref(), &peers) {
                             break reason;
                         }
                     }
@@ -120,14 +160,14 @@ pub async fn run_loop(
 
             // --- Swarm events ---
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, &mut in_flight, keypair, store.as_ref());
+                let action = handle_swarm_event(event, &mut in_flight, &mut peers, keypair, store.as_ref());
                 apply_swarm_action(&mut swarm, action);
             }
         }
     };
 
     // --- Graceful shutdown sequence ---
-    drain_in_flight(&mut swarm, &mut in_flight, keypair, store.as_ref()).await;
+    drain_in_flight(&mut swarm, &mut in_flight, &mut peers, keypair, store.as_ref()).await;
 
     if let Some(flush) = wal_flush {
         info!("flushing SQLite WAL checkpoint");
@@ -143,6 +183,7 @@ pub async fn run_loop(
 async fn drain_in_flight(
     swarm: &mut Swarm<SlashmailBehaviour>,
     in_flight: &mut usize,
+    peers: &mut HashMap<PeerId, PeerState>,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
 ) {
@@ -165,7 +206,7 @@ async fn drain_in_flight(
                 break;
             }
             event = swarm.select_next_some() => {
-                let action = handle_swarm_event(event, in_flight, keypair, store);
+                let action = handle_swarm_event(event, in_flight, peers, keypair, store);
                 apply_swarm_action(swarm, action);
                 if *in_flight == 0 {
                     info!("all in-flight requests drained");
@@ -181,6 +222,7 @@ fn handle_command(
     swarm: &mut Swarm<SlashmailBehaviour>,
     command: EngineCommand,
     store: Option<&MessageStore>,
+    peers: &HashMap<PeerId, PeerState>,
 ) -> Option<ShutdownReason> {
     match command {
         EngineCommand::Subscribe { topic } => {
@@ -244,6 +286,36 @@ fn handle_command(
             let _ = reply.send(result);
             None
         }
+        EngineCommand::GetStatus { reply } => {
+            let peer_id = swarm.local_peer_id().to_string();
+            let listen_addrs: Vec<String> = swarm.listeners().map(|a| a.to_string()).collect();
+            let external_addrs: Vec<String> = swarm
+                .external_addresses()
+                .map(|a| a.to_string())
+                .collect();
+            let num_peers = peers.len();
+            let _ = reply.send(StatusInfo {
+                peer_id,
+                listen_addrs,
+                external_addrs,
+                num_peers,
+            });
+            None
+        }
+        EngineCommand::GetPeers { reply } => {
+            let peer_list: Vec<PeerInfo> = peers
+                .iter()
+                .map(|(pid, state)| PeerInfo {
+                    peer_id: pid.to_string(),
+                    addrs: state.listen_addrs.iter().map(|a| a.to_string()).collect(),
+                    connected_since: state.connected_since.to_rfc3339(),
+                    protocols: state.protocols.clone(),
+                    rtt_ms: state.rtt.map(|d| d.as_secs_f64() * 1000.0),
+                })
+                .collect();
+            let _ = reply.send(peer_list);
+            None
+        }
         EngineCommand::Shutdown => {
             info!("shutdown command received");
             Some(ShutdownReason::Command)
@@ -295,6 +367,7 @@ fn apply_swarm_action(
 fn handle_swarm_event(
     event: SwarmEvent<SlashmailBehaviourEvent>,
     in_flight: &mut usize,
+    peers: &mut HashMap<PeerId, PeerState>,
     keypair: Option<&Keypair>,
     store: Option<&MessageStore>,
 ) -> SwarmAction {
@@ -310,6 +383,41 @@ fn handle_swarm_event(
             SwarmAction::None
         }
 
+        // --- Identify events (peer metadata) ---
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
+            debug!(%peer_id, agent = %info.agent_version, "identify received");
+            if let Some(state) = peers.get_mut(&peer_id) {
+                state.protocols = info.protocols.iter().map(|p| p.to_string()).collect();
+                state.listen_addrs = info.listen_addrs;
+            }
+            SwarmAction::None
+        }
+
+        // --- Ping events (latency measurement) ---
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Ok(rtt),
+            ..
+        })) => {
+            debug!(%peer, ?rtt, "ping success");
+            if let Some(state) = peers.get_mut(&peer) {
+                state.rtt = Some(rtt);
+            }
+            SwarmAction::None
+        }
+        SwarmEvent::Behaviour(SlashmailBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Err(e),
+            ..
+        })) => {
+            debug!(%peer, %e, "ping failure");
+            SwarmAction::None
+        }
+
         // --- Other behaviour events ---
         SwarmEvent::Behaviour(event) => {
             debug!(?event, "behaviour event");
@@ -321,12 +429,23 @@ fn handle_swarm_event(
             info!(%address, "new listen address");
             SwarmAction::None
         }
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
             info!(%peer_id, "connection established");
+            if num_established.get() == 1 {
+                peers.insert(peer_id, PeerState {
+                    connected_since: Utc::now(),
+                    protocols: Vec::new(),
+                    listen_addrs: Vec::new(),
+                    rtt: None,
+                });
+            }
             SwarmAction::None
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             debug!(%peer_id, "connection closed");
+            if num_established == 0 {
+                peers.remove(&peer_id);
+            }
             SwarmAction::None
         }
         SwarmEvent::IncomingConnection { local_addr, .. } => {
@@ -761,9 +880,10 @@ mod tests {
     async fn drain_returns_immediately_when_no_in_flight() {
         let (mut swarm, _tx, _rx) = setup().await;
         let mut in_flight: usize = 0;
+        let mut peers = HashMap::new();
 
         let start = tokio::time::Instant::now();
-        drain_in_flight(&mut swarm, &mut in_flight, None, None).await;
+        drain_in_flight(&mut swarm, &mut in_flight, &mut peers, None, None).await;
         let elapsed = start.elapsed();
 
         assert!(

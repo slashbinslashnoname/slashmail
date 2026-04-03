@@ -2,7 +2,7 @@
 //! and request-response for direct mail delivery.
 
 use libp2p::identity::Keypair;
-use libp2p::{gossipsub, identify, kad, mdns, request_response, swarm::NetworkBehaviour, PeerId};
+use libp2p::{gossipsub, identify, kad, mdns, ping, request_response, swarm::NetworkBehaviour, PeerId};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -16,6 +16,7 @@ pub struct SlashmailBehaviour {
     pub identify: identify::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
+    pub ping: ping::Behaviour,
 }
 
 /// Error type for behaviour construction.
@@ -58,12 +59,16 @@ impl SlashmailBehaviour {
         // Request-response for direct private mail delivery.
         let mail_rr = rr::mail_behaviour();
 
+        // Ping for latency measurement.
+        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
+
         Ok(Self {
             gossipsub,
             kademlia,
             identify,
             mdns,
             mail_rr,
+            ping,
         })
     }
 }
