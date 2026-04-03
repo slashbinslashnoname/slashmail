@@ -543,6 +543,46 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Advisory lock file
+// ---------------------------------------------------------------------------
+
+/// Acquire an exclusive advisory lock on `~/.slashmail/daemon.lock`.
+///
+/// Uses `flock(LOCK_EX | LOCK_NB)` so the call is non-blocking. If another
+/// daemon instance already holds the lock the function returns an error
+/// immediately.
+///
+/// The caller **must** keep the returned `File` alive for the entire daemon
+/// lifetime — the OS releases the lock automatically when the file descriptor
+/// is closed (including on crash / SIGKILL).
+#[cfg(unix)]
+fn acquire_daemon_lock() -> Result<std::fs::File> {
+    use nix::fcntl::{flock, FlockArg};
+    use std::os::unix::io::AsRawFd;
+
+    Config::ensure_dir()?;
+    let lock_path = Config::lock_path()?;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| AppError::io(&lock_path, e))?;
+
+    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        Ok(()) => Ok(file),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Err(AppError::InvalidInput(
+            "another daemon instance is already running (lock file held)".into(),
+        )
+        .into()),
+        Err(e) => Err(AppError::Other(format!(
+            "failed to acquire daemon lock: {e}"
+        ))
+        .into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PID file management
 // ---------------------------------------------------------------------------
 
@@ -627,6 +667,10 @@ async fn run_daemon_start(listen: String) -> Result<()> {
     use crate::storage::db::MessageStore;
     use libp2p::Multiaddr;
     use tokio::sync::mpsc;
+
+    // Acquire an exclusive advisory lock to prevent concurrent daemon starts.
+    // The lock is held for the entire daemon lifetime and released on drop.
+    let _lock_file = acquire_daemon_lock()?;
 
     // Check for an already-running daemon via PID file.
     if let Some(pid) = read_pid_file()? {

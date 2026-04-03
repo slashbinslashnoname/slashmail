@@ -527,6 +527,83 @@ mod pid_tests {
     }
 }
 
+// -- Advisory lock file -------------------------------------------------------
+
+#[cfg(unix)]
+mod lock_tests {
+    use std::os::unix::io::AsRawFd;
+    use nix::fcntl::{flock, FlockArg};
+    use tempfile::TempDir;
+
+    /// Acquiring a lock on a fresh file succeeds.
+    #[test]
+    fn acquire_lock_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        let result = flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock);
+        assert!(result.is_ok(), "should acquire lock on fresh file");
+    }
+
+    /// A second attempt to lock the same file fails with EWOULDBLOCK.
+    #[test]
+    fn second_lock_fails() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+
+        let file1 = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        flock(file1.as_raw_fd(), FlockArg::LockExclusiveNonblock).unwrap();
+
+        // Open a second fd and try to lock.
+        let file2 = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let result = flock(file2.as_raw_fd(), FlockArg::LockExclusiveNonblock);
+        assert!(result.is_err(), "second lock should fail");
+        assert_eq!(
+            result.unwrap_err(),
+            nix::errno::Errno::EWOULDBLOCK,
+            "error should be EWOULDBLOCK"
+        );
+    }
+
+    /// Dropping the file releases the lock, allowing re-acquisition.
+    #[test]
+    fn lock_released_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+
+        {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).unwrap();
+            // file dropped here
+        }
+
+        // Should succeed now that the first fd is closed.
+        let file2 = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let result = flock(file2.as_raw_fd(), FlockArg::LockExclusiveNonblock);
+        assert!(result.is_ok(), "lock should be available after drop");
+    }
+}
+
 // -- No-args handler / help output -------------------------------------------
 
 #[test]
