@@ -30,6 +30,15 @@ pub struct MessageStore {
     conn: Connection,
 }
 
+/// Read-only SQLite message store.
+///
+/// Opens the database with `PRAGMA query_only = ON` to prevent accidental writes
+/// from CLI read commands (list, search). This avoids SQLITE_BUSY contention with
+/// the daemon's read-write connection in WAL mode.
+pub struct ReadOnlyMessageStore {
+    conn: Connection,
+}
+
 impl MessageStore {
     /// Open (or create) the database at `path` and run migrations.
     pub fn open(path: &Path) -> Result<Self, AppError> {
@@ -330,6 +339,85 @@ impl MessageStore {
             params![envelope_id.to_string()],
         )?;
         Ok(())
+    }
+}
+
+impl ReadOnlyMessageStore {
+    /// Open a read-only connection to the database at `path`.
+    ///
+    /// Sets `PRAGMA query_only = ON` so any attempt to execute a write statement
+    /// (INSERT, UPDATE, DELETE, CREATE, etc.) will fail with an error.
+    pub fn open(path: &Path) -> Result<Self, AppError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(Self { conn })
+    }
+
+    /// List messages ordered by creation time (newest first).
+    /// Pass `limit = 0` for no limit.
+    pub fn list_messages(&self, limit: u32) -> Result<Vec<Message>, AppError> {
+        let limit_val: i64 = if limit > 0 { limit as i64 } else { -1 };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, swarm_id, folder_path, sender_pubkey, sender, recipient, subject, body, tags, created_at, read
+             FROM messages ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit_val], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
+    /// Full-text search across sender, recipient, subject, body, and tags.
+    pub fn search_messages(&self, query: &str) -> Result<Vec<Message>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.tags, m.created_at, m.read
+             FROM messages m
+             JOIN messages_fts fts ON m.rowid = fts.rowid
+             WHERE messages_fts MATCH ?1
+             ORDER BY fts.rank",
+        )?;
+        let rows = stmt.query_map(params![query], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
+    /// Get all tags for a given message.
+    pub fn get_message_tags(&self, envelope_id: &Uuid) -> Result<Vec<String>, AppError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM message_tags WHERE envelope_id = ?1 ORDER BY tag")?;
+        let rows = stmt.query_map(params![envelope_id.to_string()], |row| row.get(0))?;
+        let mut tags = Vec::new();
+        for row in rows {
+            tags.push(row?);
+        }
+        Ok(tags)
+    }
+
+    /// Get all messages with a given tag, ordered by creation time (newest first).
+    pub fn messages_by_tag(&self, tag: &str) -> Result<Vec<Message>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.swarm_id, m.folder_path, m.sender_pubkey, m.sender, m.recipient, m.subject, m.body, m.tags, m.created_at, m.read
+             FROM messages m
+             JOIN message_tags mt ON m.id = mt.envelope_id
+             WHERE mt.tag = ?1
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![tag], row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
     }
 }
 
@@ -1086,5 +1174,124 @@ mod tests {
             let fts = store.search_messages("tags:saved").unwrap();
             assert_eq!(fts.len(), 1);
         }
+    }
+
+    // --- ReadOnlyMessageStore tests ---
+
+    /// Helper: create a file-based store, populate it, close it, return the path.
+    fn populate_file_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("readonly_test.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let m1 = make_message("alice", "bob", "Hello", "First message body");
+        let m2 = make_message("carol", "bob", "Report", "Quarterly earnings");
+        let m3 = make_message("dave", "alice", "Lunch", "Coffee at noon");
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+        store.insert_message(&m3).unwrap();
+
+        store.tag_message(&m1.id, "important").unwrap();
+        store.tag_message(&m1.id, "inbox").unwrap();
+        store.tag_message(&m2.id, "work").unwrap();
+
+        store.flush_wal().unwrap();
+        drop(store);
+        db_path
+    }
+
+    #[test]
+    fn read_only_store_lists_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let messages = ro.list_messages(0).unwrap();
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn read_only_store_respects_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let messages = ro.list_messages(2).unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn read_only_store_searches_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let results = ro.search_messages("coffee").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sender, "dave");
+    }
+
+    #[test]
+    fn read_only_store_gets_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        // Re-open read-write to get the message ID
+        let rw = MessageStore::open(&db_path).unwrap();
+        let msgs = rw.list_messages(0).unwrap();
+        let alice_msg = msgs.iter().find(|m| m.sender == "alice").unwrap();
+        let alice_id = alice_msg.id;
+        drop(rw);
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let tags = ro.get_message_tags(&alice_id).unwrap();
+        assert_eq!(tags, vec!["important", "inbox"]);
+    }
+
+    #[test]
+    fn read_only_store_filters_by_tag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let work_msgs = ro.messages_by_tag("work").unwrap();
+        assert_eq!(work_msgs.len(), 1);
+        assert_eq!(work_msgs[0].sender, "carol");
+    }
+
+    #[test]
+    fn read_only_store_rejects_insert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        // Attempt a write via raw SQL — should fail because of read-only open flags.
+        let result = ro.conn.execute(
+            "INSERT INTO messages (id, sender, recipient) VALUES ('x', 'a', 'b')",
+            [],
+        );
+        assert!(result.is_err(), "write must fail on read-only store");
+    }
+
+    #[test]
+    fn read_only_store_rejects_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let result = ro.conn.execute("DELETE FROM messages", []);
+        assert!(result.is_err(), "delete must fail on read-only store");
+    }
+
+    #[test]
+    fn read_only_store_rejects_update() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = populate_file_db(tmp.path());
+
+        let ro = ReadOnlyMessageStore::open(&db_path).unwrap();
+        let result = ro.conn.execute(
+            "UPDATE messages SET subject = 'hacked' WHERE 1=1",
+            [],
+        );
+        assert!(result.is_err(), "update must fail on read-only store");
     }
 }

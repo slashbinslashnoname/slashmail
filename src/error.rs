@@ -33,6 +33,9 @@ pub enum AppError {
     #[error("network error: {0}")]
     Network(String),
 
+    #[error("this operation requires a running daemon (start with `slashmail daemon`)")]
+    DaemonRequired,
+
     #[error("{0}")]
     Other(String),
 }
