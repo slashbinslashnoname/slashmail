@@ -1,8 +1,12 @@
 //! Composite network behaviour combining Gossipsub, Kademlia, Identify, mDNS,
-//! and request-response for direct mail delivery.
+//! request-response for direct mail delivery, relay client, dcutr (NAT
+//! hole-punching), and autonat (NAT status detection).
 
 use libp2p::identity::Keypair;
-use libp2p::{gossipsub, identify, kad, mdns, ping, request_response, swarm::NetworkBehaviour, PeerId};
+use libp2p::{
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
+    swarm::NetworkBehaviour, PeerId,
+};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -17,6 +21,9 @@ pub struct SlashmailBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub mail_rr: request_response::Behaviour<MailCodec>,
     pub ping: ping::Behaviour,
+    pub relay_client: relay::client::Behaviour,
+    pub dcutr: dcutr::Behaviour,
+    pub autonat: autonat::Behaviour,
 }
 
 /// Error type for behaviour construction.
@@ -25,8 +32,11 @@ pub struct SlashmailBehaviour {
 pub struct BehaviourError(String);
 
 impl SlashmailBehaviour {
-    /// Build a new composite behaviour from a libp2p identity keypair.
-    pub fn new(key: &Keypair) -> Result<Self, BehaviourError> {
+    /// Build a new composite behaviour from a libp2p identity keypair and an already-constructed
+    /// relay client behaviour. The relay client must be obtained from [`relay::client::new`] with
+    /// its paired transport registered in the swarm's transport stack (use
+    /// [`SwarmBuilder::with_relay_client`] to ensure this).
+    pub fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Result<Self, BehaviourError> {
         let peer_id = PeerId::from(key.public());
 
         // Gossipsub with message signing and deduplication.
@@ -62,6 +72,12 @@ impl SlashmailBehaviour {
         // Ping for latency measurement.
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
 
+        // DCUtR (Direct Connection Upgrade through Relay) for NAT hole punching.
+        let dcutr = dcutr::Behaviour::new(peer_id);
+
+        // AutoNAT for automatic NAT status detection.
+        let autonat = autonat::Behaviour::new(peer_id, Default::default());
+
         Ok(Self {
             gossipsub,
             kademlia,
@@ -69,6 +85,9 @@ impl SlashmailBehaviour {
             mdns,
             mail_rr,
             ping,
+            relay_client,
+            dcutr,
+            autonat,
         })
     }
 }
@@ -77,17 +96,29 @@ impl SlashmailBehaviour {
 mod tests {
     use super::*;
 
+    fn make_behaviour(key: &Keypair) -> SlashmailBehaviour {
+        let peer_id = PeerId::from(key.public());
+        // relay::client::new returns a (transport, behaviour) pair. In tests we
+        // drop the transport immediately; this is safe because unit tests never
+        // poll the swarm and therefore never trigger the relay behaviour's internal
+        // channel. Production code uses SwarmBuilder::with_relay_client so the
+        // transport stays alive for the swarm's lifetime.
+        let (_relay_transport, relay_client) = relay::client::new(peer_id);
+        SlashmailBehaviour::new(key, relay_client).unwrap()
+    }
+
     #[test]
     fn behaviour_new_succeeds() {
         let key = Keypair::generate_ed25519();
-        let behaviour = SlashmailBehaviour::new(&key);
-        assert!(behaviour.is_ok());
+        let peer_id = PeerId::from(key.public());
+        let (_relay_transport, relay_client) = relay::client::new(peer_id);
+        assert!(SlashmailBehaviour::new(&key, relay_client).is_ok());
     }
 
     #[test]
     fn behaviour_gossipsub_subscribe_then_unsubscribe() {
         let key = Keypair::generate_ed25519();
-        let mut behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let mut behaviour = make_behaviour(&key);
         let topic = gossipsub::IdentTopic::new("another-topic");
         assert!(behaviour.gossipsub.subscribe(&topic).is_ok());
         assert!(behaviour.gossipsub.unsubscribe(&topic).is_ok());
@@ -96,9 +127,30 @@ mod tests {
     #[test]
     fn behaviour_gossipsub_accepts_subscription() {
         let key = Keypair::generate_ed25519();
-        let mut behaviour = SlashmailBehaviour::new(&key).unwrap();
+        let mut behaviour = make_behaviour(&key);
         let topic = gossipsub::IdentTopic::new("test-topic");
         let result = behaviour.gossipsub.subscribe(&topic);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn behaviour_has_relay_client() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = make_behaviour(&key);
+        let _ = &behaviour.relay_client;
+    }
+
+    #[test]
+    fn behaviour_has_dcutr() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = make_behaviour(&key);
+        let _ = &behaviour.dcutr;
+    }
+
+    #[test]
+    fn behaviour_has_autonat() {
+        let key = Keypair::generate_ed25519();
+        let behaviour = make_behaviour(&key);
+        let _ = &behaviour.autonat;
     }
 }

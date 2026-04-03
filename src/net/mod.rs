@@ -47,8 +47,10 @@ pub async fn build_swarm(
         .with_quic()
         .with_dns()
         .map_err(|e| AppError::Network(format!("DNS transport setup failed: {e}")))?
-        .with_behaviour(|key| {
-            behaviour::SlashmailBehaviour::new(key)
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+        .map_err(|e| AppError::Network(format!("relay client setup failed: {e}")))?
+        .with_behaviour(|key, relay_client| {
+            behaviour::SlashmailBehaviour::new(key, relay_client)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         })
         .map_err(|e| AppError::Network(format!("behaviour setup failed: {e}")))?

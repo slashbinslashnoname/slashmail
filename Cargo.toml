@@ -27,6 +27,9 @@ libp2p = { version = "0.54", features = [
     "request-response",
     "ping",
     "serde",
+    "autonat",
+    "dcutr",
+    "relay",
 ] }
 
 # Cryptography
