@@ -320,6 +320,28 @@ mod tests {
         assert_eq!(ExitCode::Success.as_i32(), 0);
     }
 
+    #[test]
+    fn exit_code_from_config_parse() {
+        let err = AppError::ConfigParse {
+            path: PathBuf::from("/etc/slashmail.toml"),
+            source: toml::from_str::<toml::Value>("= bad").unwrap_err(),
+        };
+        assert_eq!(ExitCode::from(&err), ExitCode::InvalidInput);
+        assert_eq!(ExitCode::InvalidInput.as_i32(), 2);
+    }
+
+    #[test]
+    fn exit_code_from_config_serialize() {
+        let err = AppError::ConfigSerialize(toml::to_string(&()).unwrap_err());
+        assert_eq!(ExitCode::from(&err), ExitCode::InvalidInput);
+    }
+
+    #[test]
+    fn exit_code_from_keyring_error() {
+        let err = AppError::Keyring(keyring::Error::NoEntry);
+        assert_eq!(ExitCode::from(&err), ExitCode::IoError);
+    }
+
     // -- ErrorCode mapping -------------------------------------------------
 
     #[test]
@@ -328,6 +350,21 @@ mod tests {
         assert_eq!(ErrorCode::from(&AppError::Network("x".into())), ErrorCode::NetworkError);
         assert_eq!(ErrorCode::from(&AppError::Crypto("x".into())), ErrorCode::CryptoError);
         assert_eq!(ErrorCode::from(&AppError::Other("x".into())), ErrorCode::GeneralError);
+        assert_eq!(
+            ErrorCode::from(&AppError::Io {
+                path: PathBuf::from("/x"),
+                source: std::io::Error::new(std::io::ErrorKind::Other, "e"),
+            }),
+            ErrorCode::IoError,
+        );
+        assert_eq!(
+            ErrorCode::from(&AppError::Keyring(keyring::Error::NoEntry)),
+            ErrorCode::KeyringError,
+        );
+        assert_eq!(
+            ErrorCode::from(&AppError::ConfigSerialize(toml::to_string(&()).unwrap_err())),
+            ErrorCode::ConfigSerialize,
+        );
     }
 
     // -- JSON envelope serialization ---------------------------------------
