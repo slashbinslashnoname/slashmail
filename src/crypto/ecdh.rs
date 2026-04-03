@@ -8,7 +8,7 @@
 
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::signing::{Keypair, PublicKey};
 
@@ -33,8 +33,8 @@ pub struct SharedSecret([u8; 32]);
 /// from the SHA-512 expansion of the Ed25519 seed — the standard
 /// Ed25519-to-X25519 conversion (RFC 7748 / libsodium `crypto_sign_ed25519_sk_to_curve25519`).
 pub fn ed25519_to_x25519_secret(signing_key: &Keypair) -> X25519Secret {
-    let scalar_bytes = signing_key.to_scalar_bytes();
-    X25519Secret(StaticSecret::from(scalar_bytes))
+    let scalar_bytes = Zeroizing::new(signing_key.to_scalar_bytes());
+    X25519Secret(StaticSecret::from(*scalar_bytes))
 }
 
 /// Derive an X25519 public key from an Ed25519 verifying key.
