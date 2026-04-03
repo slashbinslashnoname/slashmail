@@ -109,6 +109,11 @@ impl Config {
         Ok(Self::data_dir()?.join("daemon.pid"))
     }
 
+    /// Return the path to the daemon lock file (`~/.slashmail/daemon.lock`).
+    pub fn lock_path() -> Result<PathBuf, AppError> {
+        Ok(Self::data_dir()?.join("daemon.lock"))
+    }
+
     /// Ensure the `~/.slashmail/` directory exists. Creates it if missing.
     pub fn ensure_dir() -> Result<PathBuf, AppError> {
         let dir = Self::data_dir()?;
