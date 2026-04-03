@@ -3,17 +3,17 @@
 //! Converts Ed25519 signing keys to X25519 Diffie-Hellman keys, then computes
 //! a shared secret suitable for use with XChaCha20-Poly1305.
 
-use sha2::{Sha256, Digest};
-use x25519_dalek;
+use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
 
 use super::signing::{Keypair, PublicKey};
 
 /// An X25519 static secret derived from an Ed25519 signing key.
-pub struct X25519Secret(x25519_dalek::StaticSecret);
+pub struct X25519Secret(StaticSecret);
 
 /// An X25519 public key derived from an Ed25519 verifying key.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct X25519Public(x25519_dalek::PublicKey);
+pub struct X25519Public(X25519DalekPublicKey);
 
 /// Derive an X25519 static secret from an Ed25519 signing key.
 ///
@@ -22,7 +22,7 @@ pub struct X25519Public(x25519_dalek::PublicKey);
 /// Ed25519-to-X25519 conversion (RFC 7748 / libsodium `crypto_sign_ed25519_sk_to_curve25519`).
 pub fn ed25519_to_x25519_secret(signing_key: &Keypair) -> X25519Secret {
     let scalar_bytes = signing_key.to_scalar_bytes();
-    X25519Secret(x25519_dalek::StaticSecret::from(scalar_bytes))
+    X25519Secret(StaticSecret::from(scalar_bytes))
 }
 
 /// Derive an X25519 public key from an Ed25519 verifying key.
@@ -30,7 +30,7 @@ pub fn ed25519_to_x25519_secret(signing_key: &Keypair) -> X25519Secret {
 /// Converts the Edwards-form public point to Montgomery form.
 pub fn ed25519_to_x25519_public(verifying_key: &PublicKey) -> X25519Public {
     let montgomery = verifying_key.to_montgomery();
-    X25519Public(x25519_dalek::PublicKey::from(montgomery.to_bytes()))
+    X25519Public(X25519DalekPublicKey::from(montgomery.to_bytes()))
 }
 
 /// Compute a 32-byte shared secret from our Ed25519 signing key and
@@ -87,7 +87,7 @@ mod tests {
         let x_public = ed25519_to_x25519_public(&ed_key.verifying_key());
         // The X25519 public key derived from the verifying key should match
         // the public key derived from the secret.
-        let public_from_secret = x25519_dalek::PublicKey::from(&x_secret.0);
+        let public_from_secret = X25519DalekPublicKey::from(&x_secret.0);
         assert_eq!(x_public.0.as_bytes(), public_from_secret.as_bytes());
     }
 
