@@ -21,7 +21,7 @@ use crate::crypto::signing::{self, Keypair, PublicKey};
 use crate::message::codec as msg_codec;
 use crate::net::behaviour::{SlashmailBehaviour, SlashmailBehaviourEvent};
 use crate::net::peer_exchange::{
-    self, PeerExchangeRequest, PeerExchangeResponse, PeerInfo,
+    self, PeerExchangeRequest, PeerExchangeResponse,
 };
 use crate::net::rr::{MailRequest, MailResponse};
 use crate::storage::db::{Message, MessageStore};
@@ -346,11 +346,11 @@ enum SwarmAction {
     /// Send a peer exchange response and dial received peers.
     PeerExchangeRespond {
         channel: request_response::ResponseChannel<PeerExchangeResponse>,
-        peers_received: Vec<PeerInfo>,
+        peers_received: Vec<peer_exchange::PeerInfo>,
     },
     /// Dial peers learned from a peer exchange response.
     PeerExchangeLearn {
-        peers_received: Vec<PeerInfo>,
+        peers_received: Vec<peer_exchange::PeerInfo>,
     },
 }
 
@@ -404,7 +404,7 @@ fn apply_swarm_action(
 
 /// Collect the current peer routing table from the swarm's connected peers
 /// and their known/listened addresses.
-fn collect_peer_table(swarm: &mut Swarm<SlashmailBehaviour>) -> Vec<PeerInfo> {
+fn collect_peer_table(swarm: &mut Swarm<SlashmailBehaviour>) -> Vec<peer_exchange::PeerInfo> {
     let local_peer_id = *swarm.local_peer_id();
     let mut table = Vec::new();
 
@@ -436,7 +436,7 @@ fn collect_peer_table(swarm: &mut Swarm<SlashmailBehaviour>) -> Vec<PeerInfo> {
 }
 
 /// Dial peers learned from a peer exchange, skipping already-connected peers.
-fn dial_learned_peers(swarm: &mut Swarm<SlashmailBehaviour>, peers: &[PeerInfo]) {
+fn dial_learned_peers(swarm: &mut Swarm<SlashmailBehaviour>, peers: &[peer_exchange::PeerInfo]) {
     let local_peer_id = *swarm.local_peer_id();
     let connected: std::collections::HashSet<libp2p::PeerId> =
         swarm.connected_peers().copied().collect();
@@ -1500,7 +1500,7 @@ mod tests {
             let own_entries: Vec<_> = table
                 .iter()
                 .filter(|info| {
-                    peer_exchange::from_peer_info(info)
+                    peer_exchange::from_peer_info(*info)
                         .map(|(pid, _)| pid == peer_id)
                         .unwrap_or(false)
                 })
@@ -1567,7 +1567,7 @@ mod tests {
             let identity = Identity::generate();
             let (mut swarm, _) = build_swarm(&identity).await.unwrap();
 
-            let bad_info = PeerInfo {
+            let bad_info = peer_exchange::PeerInfo {
                 peer_id: vec![0xFF, 0xFF],
                 addrs: vec![],
             };

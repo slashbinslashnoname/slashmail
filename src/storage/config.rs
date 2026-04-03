@@ -48,6 +48,17 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
 
+    /// Optional relay node multiaddress for dcutr NAT hole-punching.
+    ///
+    /// When set, the daemon will listen through this relay so that peers
+    /// behind NAT can reach it via dcutr. Without a relay, dcutr
+    /// hole-punching is inactive — direct connections (LAN, public IP,
+    /// `add-peer`) still work normally.
+    ///
+    /// Example: `/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_addr: Option<String>,
+
     /// Known swarms, keyed by swarm ID.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub swarms: HashMap<String, SwarmEntry>,
@@ -68,6 +79,7 @@ impl Default for Config {
             public_key: None,
             listen_addr: default_listen_addr(),
             mdns_enabled: true,
+            relay_addr: None,
             swarms: HashMap::new(),
         }
     }
@@ -154,6 +166,7 @@ mod tests {
         assert_eq!(cfg.public_key, None);
         assert_eq!(cfg.listen_addr, "/ip4/0.0.0.0/tcp/0");
         assert!(cfg.mdns_enabled);
+        assert_eq!(cfg.relay_addr, None);
         assert!(cfg.swarms.is_empty());
     }
 
@@ -185,6 +198,7 @@ mod tests {
             public_key: Some("dGVzdGtleQ==".to_string()),
             listen_addr: "/ip4/127.0.0.1/tcp/4001".to_string(),
             mdns_enabled: false,
+            relay_addr: None,
             swarms,
         };
 
@@ -367,5 +381,64 @@ kind = "direct"
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.display_name, Some("Legacy".to_string()));
         assert!(cfg.swarms.is_empty());
+    }
+
+    #[test]
+    fn relay_addr_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let cfg = Config {
+            relay_addr: Some(
+                "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.relay_addr, loaded.relay_addr);
+    }
+
+    #[test]
+    fn relay_addr_none_not_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        Config::default().save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("relay_addr"),
+            "None relay_addr should be omitted from TOML"
+        );
+    }
+
+    #[test]
+    fn config_without_relay_addr_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "display_name = \"NoRelay\"\n").unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.relay_addr, None);
+    }
+
+    #[test]
+    fn config_with_relay_addr_from_raw_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+relay_addr = "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            cfg.relay_addr.as_deref(),
+            Some("/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN")
+        );
     }
 }
