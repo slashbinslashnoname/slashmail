@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use super::{message_rows, truncate_chars, Args, Command, DaemonCommand, MessageJson, MessagesResult};
+use super::{command_catalogue, message_rows, truncate_chars, Args, Command, DaemonCommand, HelpResult, MessageJson, MessagesResult};
 use crate::cli::output::OutputContext;
 use crate::storage::db::Message;
 use chrono::Utc;
@@ -11,27 +11,32 @@ fn parse(args: &[&str]) -> Args {
     Args::try_parse_from(args).expect("failed to parse args")
 }
 
+/// Unwrap the command from parsed args (panics if None).
+fn cmd(args: &Args) -> &Command {
+    args.command.as_ref().expect("expected a command")
+}
+
 #[test]
 fn parse_init() {
     let args = parse(&["slashmail", "init"]);
-    assert!(matches!(args.command, Command::Init));
+    assert!(matches!(cmd(&args), Command::Init));
     assert!(!args.json);
 }
 
 #[test]
 fn parse_status() {
     let args = parse(&["slashmail", "status"]);
-    assert!(matches!(args.command, Command::Status));
+    assert!(matches!(cmd(&args), Command::Status));
 }
 
 #[test]
 fn parse_send_with_to_and_tags() {
     let args = parse(&["slashmail", "send", "--to", "AAAA", "--body", "hello", "--tags", "inbox,urgent"]);
-    match args.command {
+    match cmd(&args) {
         Command::Send { to, body, tags } => {
             assert_eq!(to, "AAAA");
             assert_eq!(body, "hello");
-            assert_eq!(tags, vec!["inbox", "urgent"]);
+            assert_eq!(tags, &vec!["inbox", "urgent"]);
         }
         _ => panic!("expected Send"),
     }
@@ -40,7 +45,7 @@ fn parse_send_with_to_and_tags() {
 #[test]
 fn parse_send_no_tags() {
     let args = parse(&["slashmail", "send", "--to", "BBBB", "--body", "hi"]);
-    match args.command {
+    match cmd(&args) {
         Command::Send { to, body, tags } => {
             assert_eq!(to, "BBBB");
             assert_eq!(body, "hi");
@@ -65,7 +70,7 @@ fn parse_send_requires_to() {
 #[test]
 fn parse_list_no_tag() {
     let args = parse(&["slashmail", "list"]);
-    match args.command {
+    match cmd(&args) {
         Command::List { tag } => assert!(tag.is_none()),
         _ => panic!("expected List"),
     }
@@ -74,7 +79,7 @@ fn parse_list_no_tag() {
 #[test]
 fn parse_list_with_tag() {
     let args = parse(&["slashmail", "list", "--tag", "inbox"]);
-    match args.command {
+    match cmd(&args) {
         Command::List { tag } => assert_eq!(tag.as_deref(), Some("inbox")),
         _ => panic!("expected List"),
     }
@@ -83,7 +88,7 @@ fn parse_list_with_tag() {
 #[test]
 fn parse_search() {
     let args = parse(&["slashmail", "search", "hello world"]);
-    match args.command {
+    match cmd(&args) {
         Command::Search { query } => assert_eq!(query, "hello world"),
         _ => panic!("expected Search"),
     }
@@ -92,7 +97,7 @@ fn parse_search() {
 #[test]
 fn parse_add_peer() {
     let args = parse(&["slashmail", "add-peer", "/ip4/1.2.3.4/tcp/4001"]);
-    match args.command {
+    match cmd(&args) {
         Command::AddPeer { addr } => assert_eq!(addr, "/ip4/1.2.3.4/tcp/4001"),
         _ => panic!("expected AddPeer"),
     }
@@ -101,13 +106,13 @@ fn parse_add_peer() {
 #[test]
 fn parse_peers() {
     let args = parse(&["slashmail", "peers"]);
-    assert!(matches!(args.command, Command::Peers));
+    assert!(matches!(cmd(&args), Command::Peers));
 }
 
 #[test]
 fn parse_daemon_start_default_listen() {
     let args = parse(&["slashmail", "daemon", "start"]);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Start { listen } } => {
             assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
         }
@@ -118,7 +123,7 @@ fn parse_daemon_start_default_listen() {
 #[test]
 fn parse_daemon_start_custom_listen() {
     let args = parse(&["slashmail", "daemon", "start", "--listen", "/ip4/127.0.0.1/tcp/9000"]);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Start { listen } } => {
             assert_eq!(listen, "/ip4/127.0.0.1/tcp/9000");
         }
@@ -129,7 +134,7 @@ fn parse_daemon_start_custom_listen() {
 #[test]
 fn parse_daemon_start_short_listen_flag() {
     let args = parse(&["slashmail", "daemon", "start", "-l", "/ip4/0.0.0.0/tcp/5555"]);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Start { listen } } => {
             assert_eq!(listen, "/ip4/0.0.0.0/tcp/5555");
         }
@@ -141,7 +146,7 @@ fn parse_daemon_start_short_listen_flag() {
 fn parse_daemon_start_with_json_flag() {
     let args = parse(&["slashmail", "--json", "daemon", "start"]);
     assert!(args.json);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Start { listen } } => {
             assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
         }
@@ -153,7 +158,7 @@ fn parse_daemon_start_with_json_flag() {
 fn parse_daemon_stop() {
     let args = parse(&["slashmail", "daemon", "stop"]);
     assert!(matches!(
-        args.command,
+        cmd(&args),
         Command::Daemon { action: DaemonCommand::Stop }
     ));
 }
@@ -161,7 +166,7 @@ fn parse_daemon_stop() {
 #[test]
 fn parse_daemon_restart_default_listen() {
     let args = parse(&["slashmail", "daemon", "restart"]);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Restart { listen } } => {
             assert_eq!(listen, "/ip4/0.0.0.0/tcp/0");
         }
@@ -172,7 +177,7 @@ fn parse_daemon_restart_default_listen() {
 #[test]
 fn parse_daemon_restart_custom_listen() {
     let args = parse(&["slashmail", "daemon", "restart", "--listen", "/ip4/127.0.0.1/tcp/8000"]);
-    match args.command {
+    match cmd(&args) {
         Command::Daemon { action: DaemonCommand::Restart { listen } } => {
             assert_eq!(listen, "/ip4/127.0.0.1/tcp/8000");
         }
@@ -195,7 +200,7 @@ fn whoami_is_not_a_command() {
 #[test]
 fn parse_inbox_no_tag() {
     let args = parse(&["slashmail", "inbox"]);
-    match args.command {
+    match cmd(&args) {
         Command::Inbox { tag } => assert!(tag.is_none()),
         _ => panic!("expected Inbox"),
     }
@@ -204,7 +209,7 @@ fn parse_inbox_no_tag() {
 #[test]
 fn parse_inbox_with_tag() {
     let args = parse(&["slashmail", "inbox", "--tag", "urgent"]);
-    match args.command {
+    match cmd(&args) {
         Command::Inbox { tag } => assert_eq!(tag.as_deref(), Some("urgent")),
         _ => panic!("expected Inbox"),
     }
@@ -214,13 +219,13 @@ fn parse_inbox_with_tag() {
 fn parse_inbox_with_json_flag() {
     let args = parse(&["slashmail", "--json", "inbox"]);
     assert!(args.json);
-    assert!(matches!(args.command, Command::Inbox { .. }));
+    assert!(matches!(cmd(&args), Command::Inbox { .. }));
 }
 
 #[test]
 fn parse_inbox_with_short_tag() {
     let args = parse(&["slashmail", "inbox", "-t", "important"]);
-    match args.command {
+    match cmd(&args) {
         Command::Inbox { tag } => assert_eq!(tag.as_deref(), Some("important")),
         _ => panic!("expected Inbox"),
     }
@@ -232,14 +237,14 @@ fn parse_inbox_with_short_tag() {
 fn parse_json_flag_before_subcommand() {
     let args = parse(&["slashmail", "--json", "status"]);
     assert!(args.json);
-    assert!(matches!(args.command, Command::Status));
+    assert!(matches!(cmd(&args), Command::Status));
 }
 
 #[test]
 fn parse_json_flag_after_subcommand() {
     let args = parse(&["slashmail", "list", "--json"]);
     assert!(args.json);
-    assert!(matches!(args.command, Command::List { .. }));
+    assert!(matches!(cmd(&args), Command::List { .. }));
 }
 
 #[test]
@@ -252,7 +257,7 @@ fn parse_no_json_flag() {
 fn parse_json_flag_with_other_args() {
     let args = parse(&["slashmail", "--json", "list", "--tag", "inbox"]);
     assert!(args.json);
-    match args.command {
+    match cmd(&args) {
         Command::List { tag } => assert_eq!(tag.as_deref(), Some("inbox")),
         _ => panic!("expected List"),
     }
@@ -520,4 +525,69 @@ mod pid_tests {
         let pid_path = dir.path().join("daemon.pid");
         assert!(!pid_path.exists());
     }
+}
+
+// -- No-args handler / help output -------------------------------------------
+
+#[test]
+fn parse_no_args_gives_none_command() {
+    let args = parse(&["slashmail"]);
+    assert!(args.command.is_none());
+}
+
+#[test]
+fn parse_no_args_with_json_flag() {
+    let args = parse(&["slashmail", "--json"]);
+    assert!(args.json);
+    assert!(args.command.is_none());
+}
+
+#[test]
+fn command_catalogue_has_all_commands() {
+    let cat = command_catalogue();
+    let names: Vec<&str> = cat.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"init"));
+    assert!(names.contains(&"status"));
+    assert!(names.contains(&"send"));
+    assert!(names.contains(&"list"));
+    assert!(names.contains(&"search"));
+    assert!(names.contains(&"add-peer"));
+    assert!(names.contains(&"inbox"));
+    assert!(names.contains(&"peers"));
+    assert!(names.contains(&"daemon start"));
+    assert!(names.contains(&"daemon stop"));
+    assert!(names.contains(&"daemon restart"));
+}
+
+#[test]
+fn command_catalogue_descriptions_non_empty() {
+    for cmd in command_catalogue() {
+        assert!(!cmd.description.is_empty(), "command {} has empty description", cmd.name);
+    }
+}
+
+#[test]
+fn help_result_json_serializes() {
+    let result = HelpResult { commands: command_catalogue() };
+    let value: serde_json::Value = serde_json::to_value(&result).unwrap();
+    assert!(value["commands"].is_array());
+    let commands = value["commands"].as_array().unwrap();
+    assert!(commands.len() >= 9);
+    // Each entry has name, args, description
+    for entry in commands {
+        assert!(entry["name"].is_string());
+        assert!(entry["args"].is_string());
+        assert!(entry["description"].is_string());
+    }
+}
+
+#[test]
+fn help_result_json_envelope() {
+    // Verify the full JSON envelope via OutputContext
+    let ctx = OutputContext::forced(true);
+    let result = HelpResult { commands: command_catalogue() };
+    // print_success writes to stdout; just verify it doesn't panic
+    ctx.print_success(&result, || {
+        panic!("human closure should not be called in JSON mode");
+    });
 }

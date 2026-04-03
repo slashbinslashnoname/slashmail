@@ -16,8 +16,25 @@ pub use output::OutputContext;
 #[cfg(test)]
 mod tests;
 
+/// Compact help template: ~100 tokens for LLM-friendly output.
+const HELP_TEMPLATE: &str = "\
+{name} — {about}
+
+Usage: {name} [--json] <command>
+
+Commands:
+{subcommands}
+
+Flags:
+  --json  Output JSON (auto if piped)";
+
 #[derive(Parser)]
-#[command(name = "slashmail", about = "Peer-to-peer encrypted mail")]
+#[command(
+    name = "slashmail",
+    about = "Peer-to-peer encrypted mail",
+    help_template = HELP_TEMPLATE,
+    subcommand_help_heading = "Commands",
+)]
 pub struct Args {
     /// Output JSON instead of human-readable text.
     /// Auto-enabled when stdout is not a TTY.
@@ -25,7 +42,7 @@ pub struct Args {
     pub json: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -265,10 +282,64 @@ struct MessagesResult {
     count: usize,
 }
 
+// ---------------------------------------------------------------------------
+// No-args help: compact human text or JSON command catalogue
+// ---------------------------------------------------------------------------
+
+/// Single command descriptor for JSON agent discovery.
+#[derive(Debug, Serialize)]
+struct CommandInfo {
+    name: String,
+    args: String,
+    description: String,
+}
+
+/// Build the static command catalogue.
+fn command_catalogue() -> Vec<CommandInfo> {
+    vec![
+        CommandInfo { name: "init".into(), args: "".into(), description: "Initialize a new identity".into() },
+        CommandInfo { name: "status".into(), args: "".into(), description: "Show identity and node status".into() },
+        CommandInfo { name: "send".into(), args: "--to <KEY> --body <TEXT> [--tags a,b]".into(), description: "Send a message to a peer".into() },
+        CommandInfo { name: "list".into(), args: "[--tag <TAG>]".into(), description: "List messages, optionally filtered by tag".into() },
+        CommandInfo { name: "search".into(), args: "<QUERY>".into(), description: "Search messages".into() },
+        CommandInfo { name: "add-peer".into(), args: "<ADDR>".into(), description: "Add a peer by multiaddress".into() },
+        CommandInfo { name: "inbox".into(), args: "[--tag <TAG>]".into(), description: "Show inbox messages (received)".into() },
+        CommandInfo { name: "peers".into(), args: "".into(), description: "List known peers".into() },
+        CommandInfo { name: "daemon start".into(), args: "[--listen <ADDR>]".into(), description: "Start the P2P daemon".into() },
+        CommandInfo { name: "daemon stop".into(), args: "".into(), description: "Stop the running daemon".into() },
+        CommandInfo { name: "daemon restart".into(), args: "[--listen <ADDR>]".into(), description: "Restart the daemon".into() },
+    ]
+}
+
+/// JSON payload for no-args help.
+#[derive(Debug, Serialize)]
+struct HelpResult {
+    commands: Vec<CommandInfo>,
+}
+
+/// Handle the no-command case: print compact help (human) or command catalogue (JSON).
+pub fn print_help(ctx: &OutputContext) {
+    let catalogue = command_catalogue();
+    ctx.print_success(&HelpResult { commands: catalogue }, || {
+        // Use clap's rendered help via the help_template
+        let mut cmd = <Args as clap::CommandFactory>::command();
+        let _ = cmd.print_help();
+        println!(); // trailing newline
+    });
+}
+
 pub async fn run(args: Args) -> Result<()> {
     let ctx = OutputContext::new(args.json);
 
-    match args.command {
+    let command = match args.command {
+        Some(cmd) => cmd,
+        None => {
+            print_help(&ctx);
+            return Ok(());
+        }
+    };
+
+    match command {
         Command::Init => {
             tracing::info!("initializing identity");
             init::run(&ctx).await
