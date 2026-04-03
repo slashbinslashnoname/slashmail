@@ -44,6 +44,16 @@ impl Store {
         Ok(())
     }
 
+    /// Flush the WAL to the main database file via a full checkpoint.
+    ///
+    /// Should be called during graceful shutdown to ensure all writes are
+    /// persisted to the main database file.
+    pub fn flush_wal(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        Ok(())
+    }
+
     /// Access the raw connection (for advanced queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -75,5 +85,13 @@ mod tests {
         let store = Store::open_memory().unwrap();
         store.migrate().unwrap();
         store.migrate().unwrap(); // should not error
+    }
+
+    #[test]
+    fn flush_wal_succeeds() {
+        let store = Store::open_memory().unwrap();
+        store.migrate().unwrap();
+        // WAL checkpoint should succeed (no-op on in-memory, but must not error).
+        store.flush_wal().unwrap();
     }
 }
