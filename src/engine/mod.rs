@@ -1008,6 +1008,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_subscriptions_reflects_subscribe_unsubscribe() {
+        let (swarm, tx, rx) = setup().await;
+
+        tx.send(EngineCommand::Subscribe {
+            topic: "pub_general".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::GetSubscriptions { reply: reply_tx })
+            .await
+            .unwrap();
+
+        tx.send(EngineCommand::Unsubscribe {
+            topic: "pub_general".into(),
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+        tx.send(EngineCommand::GetSubscriptions { reply: reply_tx2 })
+            .await
+            .unwrap();
+
+        tx.send(EngineCommand::Shutdown).await.unwrap();
+
+        run_loop(swarm, rx, None, None, None).await;
+
+        let subs = reply_rx.await.unwrap();
+        assert_eq!(subs.values().filter(|v| v.as_str() == "pub_general").count(), 1);
+
+        let subs_after = reply_rx2.await.unwrap();
+        assert!(!subs_after.values().any(|v| v == "pub_general"));
+    }
+
+    #[tokio::test]
     async fn listen_then_shutdown() {
         let (swarm, tx, rx) = setup().await;
 
