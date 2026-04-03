@@ -603,6 +603,18 @@ mod tests {
     }
 
     #[test]
+    fn untag_message_nonexistent_is_noop() {
+        let store = MessageStore::open_memory().unwrap();
+        let m = make_message("alice", "bob", "Hi", "Hello");
+        store.insert_message(&m).unwrap();
+
+        // Removing a tag that was never applied should not error.
+        store.untag_message(&m.id, "inbox").unwrap();
+        let tags = store.get_message_tags(&m.id).unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
     fn search_returns_new_columns() {
         let store = MessageStore::open_memory().unwrap();
 
